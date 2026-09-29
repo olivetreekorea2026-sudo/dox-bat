@@ -105,6 +105,33 @@ async def bind(message: Message, command: CommandObject):
     )
 
 
+# ---------- Команда /orders (список последних заказов в группе) ----------
+@dp.message(Command("orders"), F.chat.type.in_(GROUP_TYPES))
+async def list_orders(message: Message):
+    creator = db.execute(
+        "SELECT code FROM creators WHERE group_id = ?", (message.chat.id,)
+    ).fetchone()
+    if not creator:
+        await message.reply("Эта группа ещё не привязана. Сначала выполните /bind КОД.")
+        return
+
+    rows = db.execute(
+        "SELECT id, full_name, qty, status FROM orders "
+        "WHERE creator_code = ? ORDER BY id DESC LIMIT 10",
+        (creator[0],),
+    ).fetchall()
+    if not rows:
+        await message.reply("Заказов пока нет.")
+        return
+
+    lines = ["Последние заказы:"]
+    for order_id, full_name, qty, status in rows:
+        lines.append(
+            f"№{order_id} · {STATUS_LABELS.get(status, status)} · {full_name} · {qty} пар"
+        )
+    await message.reply("\n".join(lines))
+
+
 # ---------- Ответ сотрудника/креатора в группе -> клиенту ----------
 @dp.message(F.chat.type.in_(GROUP_TYPES), F.reply_to_message)
 async def from_staff(message: Message):
@@ -305,18 +332,11 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
     )
 
     if creator and creator[0]:
-        text = (
-            f"🆕 Новый заказ №{order_id}\n"
-            f"Клиент: {data['full_name']} (id {user.id})\n"
-            f"Телефон: {data['phone']}\n"
-            f"Адрес: {data['address']}\n"
-            f"Диоптрии: {data['left_eye']} / {data['right_eye']}\n"
-            f"Цвет: {data['color']}\n"
-            f"Количество пар: {data['qty']}\n"
-            f"Код креатора: {code}"
-        )
+        text = _order_card_text(order_id, data, code, "new")
         try:
-            header = await bot.send_message(creator[0], text)
+            header = await bot.send_message(
+                creator[0], text, reply_markup=_order_status_keyboard(order_id)
+            )
             db.execute(
                 "INSERT OR REPLACE INTO msg_map(group_id, message_id, client_id) "
                 "VALUES(?, ?, ?)",
@@ -327,6 +347,84 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
             logging.error("Не удалось отправить заказ в группу: %s", e)
 
     await callback.answer()
+
+
+# ---------- Статусы заказа (кнопки на карточке в группе) ----------
+STATUS_LABELS = {
+    "new": "🆕 Новый",
+    "paid": "💰 Оплачен",
+    "shipped": "📦 Отправлен",
+    "cancelled": "❌ Отменён",
+}
+
+
+def _order_card_text(order_id, data, code, status):
+    return (
+        f"{STATUS_LABELS.get(status, status)} · заказ №{order_id}\n"
+        f"Клиент: {data['full_name']}\n"
+        f"Телефон: {data['phone']}\n"
+        f"Адрес: {data['address']}\n"
+        f"Диоптрии: {data['left_eye']} / {data['right_eye']}\n"
+        f"Цвет: {data['color']}\n"
+        f"Количество пар: {data['qty']}\n"
+        f"Код креатора: {code}"
+    )
+
+
+def _order_status_keyboard(order_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💰 Оплачен", callback_data=f"status:{order_id}:paid"
+                ),
+                InlineKeyboardButton(
+                    text="📦 Отправлен", callback_data=f"status:{order_id}:shipped"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отменён", callback_data=f"status:{order_id}:cancelled"
+                ),
+            ],
+        ]
+    )
+
+
+@dp.callback_query(F.data.startswith("status:"))
+async def order_status_change(callback: CallbackQuery):
+    _, order_id, new_status = callback.data.split(":")
+    order_id = int(order_id)
+
+    member = await bot.get_chat_member(callback.message.chat.id, callback.from_user.id)
+    if member.status not in ("creator", "administrator"):
+        await callback.answer("Менять статус может только админ группы.", show_alert=True)
+        return
+
+    row = db.execute(
+        "SELECT client_id, creator_code, full_name, address, phone, left_eye, "
+        "right_eye, color, qty FROM orders WHERE id = ?",
+        (order_id,),
+    ).fetchone()
+    if not row:
+        await callback.answer("Заказ не найден.", show_alert=True)
+        return
+
+    db.execute("UPDATE orders SET status = ? WHERE id = ?", (new_status, order_id))
+    db.commit()
+
+    data = {
+        "full_name": row[2],
+        "address": row[3],
+        "phone": row[4],
+        "left_eye": row[5],
+        "right_eye": row[6],
+        "color": row[7],
+        "qty": row[8],
+    }
+    text = _order_card_text(order_id, data, row[1], new_status)
+    await callback.message.edit_text(text, reply_markup=_order_status_keyboard(order_id))
+    await callback.answer(f"Статус обновлён: {STATUS_LABELS[new_status]}")
 
 
 # ---------- Любое сообщение клиента -> в группу его креатора ----------
