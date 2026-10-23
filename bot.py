@@ -35,6 +35,7 @@ class OrderForm(StatesGroup):
     left_eye = State()
     right_eye = State()
     color = State()
+    model = State()
     qty = State()
     confirm = State()
 
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS orders (
     left_eye TEXT,
     right_eye TEXT,
     color TEXT,
+    model TEXT,
     qty TEXT,
     status TEXT DEFAULT 'new',       -- new / paid / shipped
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -74,6 +76,13 @@ CREATE TABLE IF NOT EXISTS orders (
 """
 )
 db.commit()
+
+# Миграция: добавляем новые столбцы в уже существующую базу, если их ещё нет.
+try:
+    db.execute("ALTER TABLE orders ADD COLUMN model TEXT")
+    db.commit()
+except sqlite3.OperationalError:
+    pass  # столбец уже есть
 
 GROUP_TYPES = {"group", "supergroup"}
 
@@ -261,6 +270,13 @@ async def order_right_eye(message: Message, state: FSMContext):
 @dp.message(OrderForm.color, F.chat.type == "private")
 async def order_color(message: Message, state: FSMContext):
     await state.update_data(color=message.text or "")
+    await state.set_state(OrderForm.model)
+    await message.answer("Модель линз?")
+
+
+@dp.message(OrderForm.model, F.chat.type == "private")
+async def order_model(message: Message, state: FSMContext):
+    await state.update_data(model=message.text or "")
     await state.set_state(OrderForm.qty)
     await message.answer("Количество пар?")
 
@@ -276,6 +292,7 @@ async def order_qty(message: Message, state: FSMContext):
         f"Телефон: {data['phone']}\n"
         f"Диоптрии: {data['left_eye']} / {data['right_eye']}\n"
         f"Цвет: {data['color']}\n"
+        f"Модель: {data['model']}\n"
         f"Количество пар: {data['qty']}"
     )
     keyboard = InlineKeyboardMarkup(
@@ -309,7 +326,7 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
 
     db.execute(
         "INSERT INTO orders(client_id, creator_code, full_name, address, phone, "
-        "left_eye, right_eye, color, qty) VALUES(?,?,?,?,?,?,?,?,?)",
+        "left_eye, right_eye, color, model, qty) VALUES(?,?,?,?,?,?,?,?,?,?)",
         (
             user.id,
             code,
@@ -319,6 +336,7 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
             data["left_eye"],
             data["right_eye"],
             data["color"],
+            data["model"],
             data["qty"],
         ),
     )
@@ -366,6 +384,7 @@ def _order_card_text(order_id, data, code, status):
         f"Адрес: {data['address']}\n"
         f"Диоптрии: {data['left_eye']} / {data['right_eye']}\n"
         f"Цвет: {data['color']}\n"
+        f"Модель: {data.get('model', '')}\n"
         f"Количество пар: {data['qty']}\n"
         f"Код креатора: {code}"
     )
@@ -403,7 +422,7 @@ async def order_status_change(callback: CallbackQuery):
 
     row = db.execute(
         "SELECT client_id, creator_code, full_name, address, phone, left_eye, "
-        "right_eye, color, qty FROM orders WHERE id = ?",
+        "right_eye, color, model, qty FROM orders WHERE id = ?",
         (order_id,),
     ).fetchone()
     if not row:
@@ -420,7 +439,8 @@ async def order_status_change(callback: CallbackQuery):
         "left_eye": row[5],
         "right_eye": row[6],
         "color": row[7],
-        "qty": row[8],
+        "model": row[8],
+        "qty": row[9],
     }
     text = _order_card_text(order_id, data, row[1], new_status)
     await callback.message.edit_text(text, reply_markup=_order_status_keyboard(order_id))
