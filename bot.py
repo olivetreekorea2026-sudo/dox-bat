@@ -233,10 +233,21 @@ STEP_PROMPTS = {
     OrderForm.phone: "Номер телефона для доставки?",
     OrderForm.left_eye: "Диоптрии, левый глаз?",
     OrderForm.right_eye: "Диоптрии, правый глаз?",
-    OrderForm.color: "Цвет линз?",
+    OrderForm.color: "Выберите цвет линз:",
     OrderForm.model: "Модель линз?",
     OrderForm.qty: "Количество пар?",
 }
+
+# Список цветов для кнопок на шаге выбора цвета.
+COLORS = [
+    "Gray",
+    "Brown and Choco",
+    "Blue",
+    "Green",
+    "Violet",
+    "Black",
+    "Прозрачные и специальные линзы",
+]
 
 
 def _back_keyboard(step: int):
@@ -245,6 +256,25 @@ def _back_keyboard(step: int):
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="order_back")]]
     )
+
+
+def _step_keyboard(step: int):
+    """Клавиатура для конкретного шага анкеты: кнопки цвета на шаге цвета,
+    иначе — просто кнопка «Назад» (или ничего на первом шаге)."""
+    if STEP_ORDER[step] == OrderForm.color:
+        rows = []
+        row = []
+        for color in COLORS:
+            row.append(InlineKeyboardButton(text=color, callback_data=f"color:{color}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        if step > 0:
+            rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="order_back")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+    return _back_keyboard(step)
 
 
 def _client_creator_code(user_id: int):
@@ -283,6 +313,14 @@ async def start_order(message: Message, state: FSMContext):
 async def order_step(message: Message, state: FSMContext):
     data = await state.get_data()
     step = data.get("step", 0)
+
+    if STEP_ORDER[step] == OrderForm.color:
+        # Цвет выбирается только кнопками, текст на этом шаге игнорируем.
+        await message.answer(
+            "Пожалуйста, выберите цвет кнопкой ниже.", reply_markup=_step_keyboard(step)
+        )
+        return
+
     field = STEP_FIELDS[STEP_ORDER[step]]
     await state.update_data(**{field: message.text or ""})
     step += 1
@@ -293,7 +331,27 @@ async def order_step(message: Message, state: FSMContext):
 
     await state.update_data(step=step)
     await state.set_state(STEP_ORDER[step])
-    await message.answer(STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_back_keyboard(step))
+    await message.answer(STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_step_keyboard(step))
+
+
+@dp.callback_query(F.data.startswith("color:"), OrderForm.color)
+async def order_color_pick(callback: CallbackQuery, state: FSMContext):
+    color = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    step = data.get("step", 0)
+    await state.update_data(color=color)
+    step += 1
+    await callback.message.edit_reply_markup()
+
+    if step >= len(STEP_ORDER):
+        await _show_summary(callback.message, state)
+    else:
+        await state.update_data(step=step)
+        await state.set_state(STEP_ORDER[step])
+        await callback.message.answer(
+            STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_step_keyboard(step)
+        )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "order_back", StateFilter(*STEP_ORDER))
@@ -307,7 +365,7 @@ async def order_back(callback: CallbackQuery, state: FSMContext):
     await state.update_data(step=step)
     await state.set_state(STEP_ORDER[step])
     await callback.message.edit_reply_markup()
-    await callback.message.answer(STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_back_keyboard(step))
+    await callback.message.answer(STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_step_keyboard(step))
     await callback.answer()
 
 
@@ -317,7 +375,7 @@ async def order_back_from_confirm(callback: CallbackQuery, state: FSMContext):
     await state.update_data(step=step)
     await state.set_state(STEP_ORDER[step])
     await callback.message.edit_reply_markup()
-    await callback.message.answer(STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_back_keyboard(step))
+    await callback.message.answer(STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_step_keyboard(step))
     await callback.answer()
 
 
