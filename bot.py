@@ -202,6 +202,51 @@ async def start(message: Message, command: CommandObject):
 
 
 # ---------- Анкета заказа (только в личном чате с ботом) ----------
+STEP_ORDER = [
+    OrderForm.name,
+    OrderForm.address,
+    OrderForm.phone,
+    OrderForm.left_eye,
+    OrderForm.right_eye,
+    OrderForm.color,
+    OrderForm.model,
+    OrderForm.qty,
+]
+
+STEP_FIELDS = {
+    OrderForm.name: "full_name",
+    OrderForm.address: "address",
+    OrderForm.phone: "phone",
+    OrderForm.left_eye: "left_eye",
+    OrderForm.right_eye: "right_eye",
+    OrderForm.color: "color",
+    OrderForm.model: "model",
+    OrderForm.qty: "qty",
+}
+
+STEP_PROMPTS = {
+    OrderForm.name: "Имя и фамилия — на английском языке (например: Ivan Petrov).",
+    OrderForm.address: (
+        "Адрес доставки — на английском языке.\n"
+        "Укажите: страна, город, улица, дом, квартира, индекс, e-mail."
+    ),
+    OrderForm.phone: "Номер телефона для доставки?",
+    OrderForm.left_eye: "Диоптрии, левый глаз?",
+    OrderForm.right_eye: "Диоптрии, правый глаз?",
+    OrderForm.color: "Цвет линз?",
+    OrderForm.model: "Модель линз?",
+    OrderForm.qty: "Количество пар?",
+}
+
+
+def _back_keyboard(step: int):
+    if step <= 0:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="order_back")]]
+    )
+
+
 def _client_creator_code(user_id: int):
     row = db.execute(
         "SELECT creator_code FROM clients WHERE user_id = ?", (user_id,)
@@ -225,69 +270,62 @@ async def start_order(message: Message, state: FSMContext):
             "Чтобы оформить заказ, перейдите по персональной ссылке вашего креатора."
         )
         return
-    await state.set_state(OrderForm.name)
+    await state.update_data(step=0)
+    await state.set_state(STEP_ORDER[0])
     await message.answer(
         "Оформляем заказ. В любой момент можно написать /cancel, чтобы прервать.\n\n"
-        "Как вас зовут? (ФИО)"
+        + STEP_PROMPTS[STEP_ORDER[0]]
     )
 
 
-@dp.message(OrderForm.name, F.chat.type == "private")
-async def order_name(message: Message, state: FSMContext):
-    await state.update_data(full_name=message.text or "")
-    await state.set_state(OrderForm.address)
-    await message.answer("Страна и полный адрес доставки?")
+# ---------- Один общий шаг анкеты (вместо отдельного хендлера на каждый вопрос) ----------
+@dp.message(StateFilter(*STEP_ORDER), F.chat.type == "private")
+async def order_step(message: Message, state: FSMContext):
+    data = await state.get_data()
+    step = data.get("step", 0)
+    field = STEP_FIELDS[STEP_ORDER[step]]
+    await state.update_data(**{field: message.text or ""})
+    step += 1
+
+    if step >= len(STEP_ORDER):
+        await _show_summary(message, state)
+        return
+
+    await state.update_data(step=step)
+    await state.set_state(STEP_ORDER[step])
+    await message.answer(STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_back_keyboard(step))
 
 
-@dp.message(OrderForm.address, F.chat.type == "private")
-async def order_address(message: Message, state: FSMContext):
-    await state.update_data(address=message.text or "")
-    await state.set_state(OrderForm.phone)
-    await message.answer("Номер телефона для доставки?")
+@dp.callback_query(F.data == "order_back", StateFilter(*STEP_ORDER))
+async def order_back(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    step = data.get("step", 0)
+    if step == 0:
+        await callback.answer("Это первый вопрос анкеты.", show_alert=True)
+        return
+    step -= 1
+    await state.update_data(step=step)
+    await state.set_state(STEP_ORDER[step])
+    await callback.message.edit_reply_markup()
+    await callback.message.answer(STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_back_keyboard(step))
+    await callback.answer()
 
 
-@dp.message(OrderForm.phone, F.chat.type == "private")
-async def order_phone(message: Message, state: FSMContext):
-    await state.update_data(phone=message.text or "")
-    await state.set_state(OrderForm.left_eye)
-    await message.answer("Диоптрии, левый глаз?")
+@dp.callback_query(F.data == "order_back", OrderForm.confirm)
+async def order_back_from_confirm(callback: CallbackQuery, state: FSMContext):
+    step = len(STEP_ORDER) - 1
+    await state.update_data(step=step)
+    await state.set_state(STEP_ORDER[step])
+    await callback.message.edit_reply_markup()
+    await callback.message.answer(STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_back_keyboard(step))
+    await callback.answer()
 
 
-@dp.message(OrderForm.left_eye, F.chat.type == "private")
-async def order_left_eye(message: Message, state: FSMContext):
-    await state.update_data(left_eye=message.text or "")
-    await state.set_state(OrderForm.right_eye)
-    await message.answer("Диоптрии, правый глаз?")
-
-
-@dp.message(OrderForm.right_eye, F.chat.type == "private")
-async def order_right_eye(message: Message, state: FSMContext):
-    await state.update_data(right_eye=message.text or "")
-    await state.set_state(OrderForm.color)
-    await message.answer("Цвет линз?")
-
-
-@dp.message(OrderForm.color, F.chat.type == "private")
-async def order_color(message: Message, state: FSMContext):
-    await state.update_data(color=message.text or "")
-    await state.set_state(OrderForm.model)
-    await message.answer("Модель линз?")
-
-
-@dp.message(OrderForm.model, F.chat.type == "private")
-async def order_model(message: Message, state: FSMContext):
-    await state.update_data(model=message.text or "")
-    await state.set_state(OrderForm.qty)
-    await message.answer("Количество пар?")
-
-
-@dp.message(OrderForm.qty, F.chat.type == "private")
-async def order_qty(message: Message, state: FSMContext):
-    await state.update_data(qty=message.text or "")
+async def _show_summary(message: Message, state: FSMContext):
     data = await state.get_data()
     summary = (
         "Проверьте, пожалуйста, заказ:\n\n"
-        f"ФИО: {data['full_name']}\n"
+        f"Имя Фамилия: {data['full_name']}\n"
         f"Адрес: {data['address']}\n"
         f"Телефон: {data['phone']}\n"
         f"Диоптрии: {data['left_eye']} / {data['right_eye']}\n"
@@ -300,7 +338,8 @@ async def order_qty(message: Message, state: FSMContext):
             [
                 InlineKeyboardButton(text="✅ Подтвердить", callback_data="order_ok"),
                 InlineKeyboardButton(text="✏️ Заполнить заново", callback_data="order_redo"),
-            ]
+            ],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="order_back")],
         ]
     )
     await state.set_state(OrderForm.confirm)
@@ -309,9 +348,12 @@ async def order_qty(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "order_redo", OrderForm.confirm)
 async def order_redo(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(OrderForm.name)
+    await state.update_data(step=0)
+    await state.set_state(STEP_ORDER[0])
     await callback.message.edit_reply_markup()
-    await callback.message.answer("Хорошо, начнём заново. Как вас зовут? (ФИО)")
+    await callback.message.answer(
+        "Хорошо, начнём заново.\n\n" + STEP_PROMPTS[STEP_ORDER[0]]
+    )
     await callback.answer()
 
 
