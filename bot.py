@@ -45,6 +45,8 @@ class OrderForm(StatesGroup):
     model = State()
     qty = State()
     more = State()
+    accessories = State()
+    acc_qty = State()
     confirm = State()
 
 # ---------- База данных (простой файл SQLite) ----------
@@ -80,6 +82,12 @@ CREATE TABLE IF NOT EXISTS orders (
     qty TEXT,
     status TEXT DEFAULT 'new',       -- new / paid / shipped
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS order_accessories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER,
+    name TEXT,
+    qty INTEGER
 );
 CREATE TABLE IF NOT EXISTS order_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -247,6 +255,18 @@ MAX_ITEMS = 50  # практически без ограничений; верх
 SHORT_LIST_FROM = 6  # с такого числа товаров список выводится компактно
 TG_TEXT_LIMIT = 4000  # у Telegram предел 4096 символов на сообщение
 FIRST_ITEM_STEP = STEP_ORDER.index(OrderForm.left_eye)
+
+
+# Аксессуары, которые можно добавить к заказу (количество указывает клиент).
+ACCESSORIES = ["Раствор", "Дорожный контейнер", "Палочка для линз"]
+
+
+def _format_accessories(acc) -> str:
+    """Блок «Аксессуары» для сводки и карточки. acc — словарь или список пар (название, штук)."""
+    pairs = list(dict(acc).items())
+    if not pairs:
+        return ""
+    return "\n".join(["Аксессуары:"] + [f"{name} — {qty} шт." for name, qty in pairs])
 
 
 def _clip(text: str, limit: int = TG_TEXT_LIMIT) -> str:
@@ -485,8 +505,8 @@ async def _show_more_prompt(message: Message, state: FSMContext):
         )
         rows.append([InlineKeyboardButton(text="➕ Добавить ещё товар", callback_data="item_add")])
     else:
-        text = f"Добавлено максимальное количество товаров ({MAX_ITEMS}). Переходим к проверке заказа."
-    rows.append([InlineKeyboardButton(text="✅ Перейти к проверке", callback_data="item_done")])
+        text = f"Добавлено максимальное количество товаров ({MAX_ITEMS}). Нажмите «Далее»."
+    rows.append([InlineKeyboardButton(text="➡️ Далее", callback_data="item_done")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="order_back")])
     await state.set_state(OrderForm.more)
     await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -513,7 +533,7 @@ async def item_add(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "item_done", OrderForm.more)
 async def item_done(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_reply_markup()
-    await _show_summary(callback.message, state)
+    await _show_accessories_menu(callback.message, state)
     await callback.answer()
 
 
@@ -534,7 +554,109 @@ async def order_back_from_more(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.message(StateFilter(OrderForm.more, OrderForm.confirm), F.chat.type == "private")
+async def _show_accessories_menu(message: Message, state: FSMContext):
+    data = await state.get_data()
+    acc = data.get("accessories", {})
+    text = (
+        "Хотите добавить аксессуары к заказу?\n"
+        "Нажмите на нужный аксессуар и укажите количество."
+    )
+    if acc:
+        text += "\n\nВ заказе:\n" + "\n".join(f"• {n} — {q} шт." for n, q in acc.items())
+    rows = []
+    for i, name in enumerate(ACCESSORIES):
+        label = f"✅ {name} × {acc[name]}" if name in acc else name
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"acc:{i}")])
+    done = "➡️ Перейти к проверке" if acc else "➡️ Без аксессуаров, к проверке"
+    rows.append([InlineKeyboardButton(text=done, callback_data="acc_done")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="order_back")])
+    await state.set_state(OrderForm.accessories)
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.startswith("acc:"), OrderForm.accessories)
+async def acc_pick(callback: CallbackQuery, state: FSMContext):
+    try:
+        name = ACCESSORIES[int(callback.data.split(":", 1)[1])]
+    except (ValueError, IndexError):
+        await callback.answer()
+        return
+    data = await state.get_data()
+    acc = data.get("accessories", {})
+    await state.update_data(acc_current=name)
+    await state.set_state(OrderForm.acc_qty)
+    rows = [[InlineKeyboardButton(text=str(n), callback_data=f"accq:{n}") for n in (1, 2, 3, 4, 5)]]
+    if name in acc:
+        rows.append([InlineKeyboardButton(text="🗑 Убрать из заказа", callback_data="accq:0")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="order_back")])
+    await callback.message.edit_reply_markup()
+    await callback.message.answer(
+        f"{name}: сколько штук? Выберите кнопкой или напишите число.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+async def _set_acc_qty(state: FSMContext, qty: int):
+    data = await state.get_data()
+    acc = dict(data.get("accessories", {}))
+    name = data.get("acc_current")
+    if name:
+        if qty > 0:
+            acc[name] = qty
+        else:
+            acc.pop(name, None)
+    await state.update_data(accessories=acc, acc_current=None)
+
+
+@dp.callback_query(F.data.startswith("accq:"), OrderForm.acc_qty)
+async def acc_qty_button(callback: CallbackQuery, state: FSMContext):
+    try:
+        qty = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer()
+        return
+    await _set_acc_qty(state, qty)
+    await callback.message.edit_reply_markup()
+    await _show_accessories_menu(callback.message, state)
+    await callback.answer()
+
+
+@dp.message(OrderForm.acc_qty, F.chat.type == "private")
+async def acc_qty_text(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text.isdigit() or int(text) > 99:
+        await message.answer("Пожалуйста, укажите число от 1 до 99 или нажмите кнопку.")
+        return
+    await _set_acc_qty(state, int(text))
+    await _show_accessories_menu(message, state)
+
+
+@dp.callback_query(F.data == "acc_done", OrderForm.accessories)
+async def acc_done(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup()
+    await _show_summary(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "order_back", OrderForm.accessories)
+async def order_back_from_accessories(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup()
+    await _show_more_prompt(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "order_back", OrderForm.acc_qty)
+async def order_back_from_acc_qty(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup()
+    await _show_accessories_menu(callback.message, state)
+    await callback.answer()
+
+
+@dp.message(
+    StateFilter(OrderForm.more, OrderForm.accessories, OrderForm.confirm),
+    F.chat.type == "private",
+)
 async def order_use_buttons(message: Message):
     await message.answer(
         "Пожалуйста, воспользуйтесь кнопками под сообщением выше. "
@@ -622,7 +744,7 @@ async def order_back(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "order_back", OrderForm.confirm)
 async def order_back_from_confirm(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_reply_markup()
-    await _show_more_prompt(callback.message, state)
+    await _show_accessories_menu(callback.message, state)
     await callback.answer()
 
 
@@ -635,6 +757,9 @@ async def _show_summary(message: Message, state: FSMContext):
         f"Телефон: {data['phone']}\n\n"
         f"{_format_items(data.get('items', []))}"
     )
+    acc_text = _format_accessories(data.get("accessories", {}))
+    if acc_text:
+        summary += f"\n\n{acc_text}"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -692,6 +817,12 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
             "VALUES(?,?,?,?,?)",
             (order_id, it["left_eye"], it["right_eye"], it["color"], it["model"]),
         )
+    accessories = data.get("accessories", {})
+    for acc_name, acc_qty in accessories.items():
+        db.execute(
+            "INSERT INTO order_accessories(order_id, name, qty) VALUES(?,?,?)",
+            (order_id, acc_name, acc_qty),
+        )
     db.commit()
 
     await state.clear()
@@ -712,7 +843,7 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
     )
 
     if creator and creator[0]:
-        text = _order_card_text(order_id, data, code, "new", items)
+        text = _order_card_text(order_id, data, code, "new", items, accessories)
         try:
             header = await bot.send_message(
                 creator[0], text, reply_markup=_order_status_keyboard(order_id)
@@ -738,15 +869,27 @@ STATUS_LABELS = {
 }
 
 
-def _order_card_text(order_id, data, code, status, items):
-    return _clip(
+def _order_card_text(order_id, data, code, status, items, accessories=None):
+    parts = [
         f"{STATUS_LABELS.get(status, status)} · заказ №{order_id}\n"
         f"Клиент: {data['full_name']}\n"
         f"Телефон: {data['phone']}\n"
-        f"Адрес: {data['address']}\n\n"
-        f"{_format_items(items)}\n\n"
-        f"Код креатора: {code}"
-    )
+        f"Адрес: {data['address']}",
+        _format_items(items),
+    ]
+    acc_text = _format_accessories(accessories or {})
+    if acc_text:
+        parts.append(acc_text)
+    parts.append(f"Код креатора: {code}")
+    return _clip("\n\n".join(parts))
+
+
+def _load_accessories(order_id):
+    """Аксессуары заказа из базы (список пар «название, штук»)."""
+    return db.execute(
+        "SELECT name, qty FROM order_accessories WHERE order_id = ? ORDER BY id",
+        (order_id,),
+    ).fetchall()
 
 
 def _load_items(order_id, legacy):
@@ -808,7 +951,9 @@ async def order_status_change(callback: CallbackQuery):
         "phone": row[4],
     }
     items = _load_items(order_id, row[5:9])
-    text = _order_card_text(order_id, data, row[1], new_status, items)
+    text = _order_card_text(
+        order_id, data, row[1], new_status, items, _load_accessories(order_id)
+    )
     await callback.message.edit_text(text, reply_markup=_order_status_keyboard(order_id))
     await callback.answer(f"Статус обновлён: {STATUS_LABELS[new_status]}")
 
