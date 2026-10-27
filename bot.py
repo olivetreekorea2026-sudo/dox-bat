@@ -11,6 +11,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -234,7 +235,11 @@ STEP_PROMPTS = {
     OrderForm.left_eye: "Диоптрии, левый глаз?",
     OrderForm.right_eye: "Диоптрии, правый глаз?",
     OrderForm.color: "Выберите цвет линз:",
-    OrderForm.model: "Модель линз?",
+    OrderForm.model: (
+        "Напишите название модели линз из каталога выше "
+        "(например: MIRA BLUE).\n"
+        "Обратите внимание на доступные диоптрии рядом с моделью."
+    ),
     OrderForm.qty: "Количество пар?",
 }
 
@@ -248,6 +253,19 @@ COLORS = [
     "Black",
     "Прозрачные и специальные линзы",
 ]
+
+# Папка с картинками каталога (лежит рядом с bot.py в репозитории).
+CATALOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog")
+
+COLOR_CATALOG_FILES = {
+    "Gray": "Gray.jpg",
+    "Brown and Choco": "Brown_and_Choco.jpg",
+    "Blue": "Blue.png",
+    "Green": "Green.png",
+    "Violet": "Violet.png",
+    "Black": "Black.png",
+    "Прозрачные и специальные линзы": "Прозрачные_и_специальные_линзы.png",
+}
 
 
 def _back_keyboard(step: int):
@@ -342,6 +360,21 @@ async def order_color_pick(callback: CallbackQuery, state: FSMContext):
     await state.update_data(color=color)
     step += 1
     await callback.message.edit_reply_markup()
+
+    # Присылаем страницу каталога с выбранным цветом (там же видны диоптрии по моделям).
+    filename = COLOR_CATALOG_FILES.get(color)
+    if filename:
+        path = os.path.join(CATALOG_DIR, filename)
+        try:
+            await callback.message.answer_photo(
+                FSInputFile(path),
+                caption=(
+                    f"Каталог: {color}.\n"
+                    "Диоптрии, доступные для каждой модели, указаны под названием."
+                ),
+            )
+        except (FileNotFoundError, TelegramAPIError) as e:
+            logging.error("Не удалось отправить каталог %s: %s", filename, e)
 
     if step >= len(STEP_ORDER):
         await _show_summary(callback.message, state)
