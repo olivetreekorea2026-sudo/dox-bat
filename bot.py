@@ -229,7 +229,6 @@ STEP_ORDER = [
     OrderForm.right_eye,
     OrderForm.color,
     OrderForm.model,
-    OrderForm.qty,
 ]
 
 STEP_FIELDS = {
@@ -240,11 +239,10 @@ STEP_FIELDS = {
     OrderForm.right_eye: "right_eye",
     OrderForm.color: "color",
     OrderForm.model: "model",
-    OrderForm.qty: "qty",
 }
 
 # Поля одного товара в заказе и ограничение на количество товаров.
-ITEM_FIELDS = ["left_eye", "right_eye", "color", "model", "qty"]
+ITEM_FIELDS = ["left_eye", "right_eye", "color", "model"]
 MAX_ITEMS = 3
 FIRST_ITEM_STEP = STEP_ORDER.index(OrderForm.left_eye)
 
@@ -259,7 +257,6 @@ def _format_items(items):
         lines.append(f"Диоптрии: {it.get('left_eye') or ''} / {it.get('right_eye') or ''}")
         lines.append(f"Цвет: {it.get('color') or ''}")
         lines.append(f"Модель: {it.get('model') or ''}")
-        lines.append(f"Количество пар: {it.get('qty') or ''}")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
@@ -279,7 +276,6 @@ STEP_PROMPTS = {
         "(например: MIRA BLUE).\n"
         "Обратите внимание на доступные диоптрии рядом с моделью."
     ),
-    OrderForm.qty: "Количество пар?",
 }
 
 # Список цветов для кнопок на шаге выбора цвета.
@@ -504,18 +500,18 @@ async def item_done(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "order_back", OrderForm.more)
 async def order_back_from_more(callback: CallbackQuery, state: FSMContext):
-    """Назад с вопроса «добавить ещё товар?»: возвращаемся к количеству пар последнего товара."""
+    """Назад с вопроса «добавить ещё товар?»: возвращаемся к вопросу про модель последнего товара."""
     data = await state.get_data()
     items = list(data.get("items", []))
     if not items:
         await callback.answer()
         return
     last = items.pop()
-    step = STEP_ORDER.index(OrderForm.qty)
+    step = len(STEP_ORDER) - 1
     await state.update_data(items=items, step=step, **last)
-    await state.set_state(OrderForm.qty)
+    await state.set_state(STEP_ORDER[step])
     await callback.message.edit_reply_markup()
-    await callback.message.answer(STEP_PROMPTS[OrderForm.qty], reply_markup=_step_keyboard(step))
+    await callback.message.answer(STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_step_keyboard(step))
     await callback.answer()
 
 
@@ -657,7 +653,7 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
     first = items[0] if items else {f: "" for f in ITEM_FIELDS}
     db.execute(
         "INSERT INTO orders(client_id, creator_code, full_name, address, phone, "
-        "left_eye, right_eye, color, model, qty) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "left_eye, right_eye, color, model) VALUES(?,?,?,?,?,?,?,?,?)",
         (
             user.id,
             code,
@@ -668,15 +664,14 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
             first["right_eye"],
             first["color"],
             first["model"],
-            first["qty"],
         ),
     )
     order_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     for it in items:
         db.execute(
-            "INSERT INTO order_items(order_id, left_eye, right_eye, color, model, qty) "
-            "VALUES(?,?,?,?,?,?)",
-            (order_id, it["left_eye"], it["right_eye"], it["color"], it["model"], it["qty"]),
+            "INSERT INTO order_items(order_id, left_eye, right_eye, color, model) "
+            "VALUES(?,?,?,?,?)",
+            (order_id, it["left_eye"], it["right_eye"], it["color"], it["model"]),
         )
     db.commit()
 
@@ -738,7 +733,7 @@ def _order_card_text(order_id, data, code, status, items):
 def _load_items(order_id, legacy):
     """Товары заказа из базы; для старых заказов (без order_items) — из колонок orders."""
     rows = db.execute(
-        "SELECT left_eye, right_eye, color, model, qty FROM order_items "
+        "SELECT left_eye, right_eye, color, model FROM order_items "
         "WHERE order_id = ? ORDER BY id",
         (order_id,),
     ).fetchall()
@@ -778,7 +773,7 @@ async def order_status_change(callback: CallbackQuery):
 
     row = db.execute(
         "SELECT client_id, creator_code, full_name, address, phone, left_eye, "
-        "right_eye, color, model, qty FROM orders WHERE id = ?",
+        "right_eye, color, model FROM orders WHERE id = ?",
         (order_id,),
     ).fetchone()
     if not row:
@@ -793,7 +788,7 @@ async def order_status_change(callback: CallbackQuery):
         "address": row[3],
         "phone": row[4],
     }
-    items = _load_items(order_id, row[5:10])
+    items = _load_items(order_id, row[5:9])
     text = _order_card_text(order_id, data, row[1], new_status, items)
     await callback.message.edit_text(text, reply_markup=_order_status_keyboard(order_id))
     await callback.answer(f"Статус обновлён: {STATUS_LABELS[new_status]}")
