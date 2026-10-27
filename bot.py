@@ -243,12 +243,31 @@ STEP_FIELDS = {
 
 # Поля одного товара в заказе и ограничение на количество товаров.
 ITEM_FIELDS = ["left_eye", "right_eye", "color", "model"]
-MAX_ITEMS = 3
+MAX_ITEMS = 50  # практически без ограничений; верхняя граница — страховка
+SHORT_LIST_FROM = 6  # с такого числа товаров список выводится компактно
+TG_TEXT_LIMIT = 4000  # у Telegram предел 4096 символов на сообщение
 FIRST_ITEM_STEP = STEP_ORDER.index(OrderForm.left_eye)
+
+
+def _clip(text: str, limit: int = TG_TEXT_LIMIT) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _short(value, n: int = 40) -> str:
+    value = str(value or "")
+    return value if len(value) <= n else value[: n - 1] + "…"
 
 
 def _format_items(items):
     """Текст со списком товаров заказа (для сводки и карточки в группе)."""
+    if len(items) >= SHORT_LIST_FROM:
+        lines = [f"Товаров: {len(items)}"]
+        for i, it in enumerate(items, 1):
+            lines.append(
+                f"{i}) {_short(it.get('left_eye'), 12)} / {_short(it.get('right_eye'), 12)}"
+                f" · {_short(it.get('color'), 22)} · {_short(it.get('model'), 28)}"
+            )
+        return "\n".join(lines)
     blocks = []
     for i, it in enumerate(items, 1):
         lines = []
@@ -462,7 +481,7 @@ async def _show_more_prompt(message: Message, state: FSMContext):
     if len(items) < MAX_ITEMS:
         text = (
             f"Товар {len(items)} добавлен в заказ.\n"
-            f"Хотите добавить ещё один товар? (всего можно до {MAX_ITEMS})"
+            "Хотите добавить ещё один товар?"
         )
         rows.append([InlineKeyboardButton(text="➕ Добавить ещё товар", callback_data="item_add")])
     else:
@@ -626,7 +645,7 @@ async def _show_summary(message: Message, state: FSMContext):
         ]
     )
     await state.set_state(OrderForm.confirm)
-    await message.answer(summary, reply_markup=keyboard)
+    await message.answer(_clip(summary), reply_markup=keyboard)
 
 
 @dp.callback_query(F.data == "order_redo", OrderForm.confirm)
@@ -720,7 +739,7 @@ STATUS_LABELS = {
 
 
 def _order_card_text(order_id, data, code, status, items):
-    return (
+    return _clip(
         f"{STATUS_LABELS.get(status, status)} · заказ №{order_id}\n"
         f"Клиент: {data['full_name']}\n"
         f"Телефон: {data['phone']}\n"
