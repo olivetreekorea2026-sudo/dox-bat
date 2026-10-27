@@ -353,6 +353,62 @@ async def cancel_order(message: Message, state: FSMContext):
     await message.answer("Оформление заказа отменено. Напишите /order, чтобы начать заново.")
 
 
+async def _notify_operator(user, order_id: int) -> bool:
+    """Сообщает в группу креатора, что клиент просит связаться. True — если получилось."""
+    code = _client_creator_code(user.id)
+    if not code:
+        return False
+    creator = db.execute(
+        "SELECT group_id FROM creators WHERE code = ?", (code,)
+    ).fetchone()
+    if not creator or not creator[0]:
+        return False
+
+    name = user.full_name + (f" (@{user.username})" if user.username else "")
+    text = f"🔔 Клиент {name} просит связаться с оператором"
+    if order_id:
+        text += f" по заказу №{order_id}"
+    text += f"\nID: {user.id} · код: {code}\nОтветьте реплаем на это сообщение."
+    try:
+        sent = await bot.send_message(creator[0], text)
+    except TelegramAPIError as e:
+        logging.error("Не удалось уведомить оператора: %s", _safe_err(e))
+        return False
+    db.execute(
+        "INSERT OR REPLACE INTO msg_map(group_id, message_id, client_id) VALUES(?, ?, ?)",
+        (creator[0], sent.message_id, user.id),
+    )
+    db.commit()
+    return True
+
+
+OPERATOR_OK_TEXT = (
+    "Оператор уведомлён. Напишите ваш вопрос здесь одним или несколькими "
+    "сообщениями — мы ответим прямо в этом чате."
+)
+OPERATOR_FAIL_TEXT = (
+    "Не удалось связаться с оператором. Перейдите по персональной ссылке "
+    "вашего креатора или попробуйте позже."
+)
+
+
+@dp.message(Command("operator"), F.chat.type == "private")
+async def operator_command(message: Message):
+    ok = await _notify_operator(message.from_user, 0)
+    await message.answer(OPERATOR_OK_TEXT if ok else OPERATOR_FAIL_TEXT)
+
+
+@dp.callback_query(F.data.startswith("operator:"))
+async def operator_button(callback: CallbackQuery):
+    try:
+        order_id = int(callback.data.split(":", 1)[1] or 0)
+    except ValueError:
+        order_id = 0
+    ok = await _notify_operator(callback.from_user, order_id)
+    await callback.message.answer(OPERATOR_OK_TEXT if ok else OPERATOR_FAIL_TEXT)
+    await callback.answer()
+
+
 @dp.message(Command("order"), F.chat.type == "private")
 async def start_order(message: Message, state: FSMContext):
     if not _client_creator_code(message.from_user.id):
@@ -627,7 +683,18 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_reply_markup()
     await callback.message.answer(
-        "Спасибо! Заказ передан, мы свяжемся с вами по нему в этом чате."
+        "Спасибо! Заказ передан, мы свяжемся с вами по нему в этом чате.\n"
+        "Если остались вопросы, нажмите кнопку ниже или напишите /operator.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="💬 Связаться с оператором",
+                        callback_data=f"operator:{order_id}",
+                    )
+                ]
+            ]
+        ),
     )
 
     if creator and creator[0]:
