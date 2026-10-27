@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 from urllib.parse import quote
 
@@ -122,6 +123,14 @@ async def bind(message: Message, command: CommandObject):
     code = (command.args or "").strip().upper()
     if not code:
         await message.reply("Напишите так: /bind ANNA01")
+        return
+    # Telegram допускает в ссылке только латинские буквы, цифры, «_» и «-» (до 64 символов).
+    if not re.fullmatch(r"[A-Z0-9_-]{1,64}", code):
+        await message.reply(
+            "Код может состоять только из латинских букв, цифр, «_» и «-» "
+            "(без пробелов, апострофов и других знаков).\n"
+            "Например: /bind IZOLDA01"
+        )
         return
 
     db.execute(
