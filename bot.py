@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+from urllib.parse import quote
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
@@ -23,6 +24,11 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["BOT_TOKEN"]
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
+
+def _safe_err(e) -> str:
+    """Текст ошибки без токена бота (aiogram иногда вставляет его в сообщение)."""
+    return str(e).replace(TOKEN, "<token>")
+
 bot = Bot(TOKEN)
 # ВАЖНО: анкета хранится в памяти. Если бот перезапустится посреди анкеты,
 # клиенту придётся начать заново командой /order — это нормально для старта.
@@ -38,6 +44,7 @@ class OrderForm(StatesGroup):
     color = State()
     model = State()
     qty = State()
+    more = State()
     confirm = State()
 
 # ---------- База данных (простой файл SQLite) ----------
@@ -73,6 +80,15 @@ CREATE TABLE IF NOT EXISTS orders (
     qty TEXT,
     status TEXT DEFAULT 'new',       -- new / paid / shipped
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER,
+    left_eye TEXT,
+    right_eye TEXT,
+    color TEXT,
+    model TEXT,
+    qty TEXT
 );
 """
 )
@@ -126,8 +142,9 @@ async def list_orders(message: Message):
         return
 
     rows = db.execute(
-        "SELECT id, full_name, qty, status FROM orders "
-        "WHERE creator_code = ? ORDER BY id DESC LIMIT 10",
+        "SELECT o.id, o.full_name, "
+        "(SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id), o.status "
+        "FROM orders o WHERE o.creator_code = ? ORDER BY o.id DESC LIMIT 10",
         (creator[0],),
     ).fetchall()
     if not rows:
@@ -135,9 +152,10 @@ async def list_orders(message: Message):
         return
 
     lines = ["Последние заказы:"]
-    for order_id, full_name, qty, status in rows:
+    for order_id, full_name, n_items, status in rows:
         lines.append(
-            f"№{order_id} · {STATUS_LABELS.get(status, status)} · {full_name} · {qty} пар"
+            f"№{order_id} · {STATUS_LABELS.get(status, status)} · {full_name} · "
+            f"товаров: {n_items or 1}"
         )
     await message.reply("\n".join(lines))
 
@@ -225,6 +243,27 @@ STEP_FIELDS = {
     OrderForm.qty: "qty",
 }
 
+# Поля одного товара в заказе и ограничение на количество товаров.
+ITEM_FIELDS = ["left_eye", "right_eye", "color", "model", "qty"]
+MAX_ITEMS = 3
+FIRST_ITEM_STEP = STEP_ORDER.index(OrderForm.left_eye)
+
+
+def _format_items(items):
+    """Текст со списком товаров заказа (для сводки и карточки в группе)."""
+    blocks = []
+    for i, it in enumerate(items, 1):
+        lines = []
+        if len(items) > 1:
+            lines.append(f"Товар {i}:")
+        lines.append(f"Диоптрии: {it.get('left_eye') or ''} / {it.get('right_eye') or ''}")
+        lines.append(f"Цвет: {it.get('color') or ''}")
+        lines.append(f"Модель: {it.get('model') or ''}")
+        lines.append(f"Количество пар: {it.get('qty') or ''}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
 STEP_PROMPTS = {
     OrderForm.name: "Имя и фамилия — на английском языке (например: Ivan Petrov).",
     OrderForm.address: (
@@ -256,6 +295,9 @@ COLORS = [
 
 # Папка с картинками каталога (лежит рядом с bot.py в репозитории).
 CATALOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog")
+
+# Запасной источник картинок: прямые ссылки на файлы в репозитории GitHub.
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/olivetreekorea2026-sudo/dox-bat/main/"
 
 COLOR_CATALOG_FILES = {
     "Gray": "Gray.jpg",
@@ -318,7 +360,7 @@ async def start_order(message: Message, state: FSMContext):
             "Чтобы оформить заказ, перейдите по персональной ссылке вашего креатора."
         )
         return
-    await state.update_data(step=0)
+    await state.set_data({"step": 0, "items": []})
     await state.set_state(STEP_ORDER[0])
     await message.answer(
         "Оформляем заказ. В любой момент можно написать /cancel, чтобы прервать.\n\n"
@@ -344,12 +386,89 @@ async def order_step(message: Message, state: FSMContext):
     step += 1
 
     if step >= len(STEP_ORDER):
-        await _show_summary(message, state)
+        await _finish_item(message, state)
         return
 
     await state.update_data(step=step)
     await state.set_state(STEP_ORDER[step])
     await message.answer(STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_step_keyboard(step))
+
+
+async def _finish_item(message: Message, state: FSMContext):
+    """Сохраняет заполненный товар в список и предлагает добавить следующий."""
+    data = await state.get_data()
+    items = list(data.get("items", []))
+    items.append({f: data.get(f, "") for f in ITEM_FIELDS})
+    await state.update_data(items=items, **{f: "" for f in ITEM_FIELDS})
+    await _show_more_prompt(message, state)
+
+
+async def _show_more_prompt(message: Message, state: FSMContext):
+    data = await state.get_data()
+    items = data.get("items", [])
+    rows = []
+    if len(items) < MAX_ITEMS:
+        text = (
+            f"Товар {len(items)} добавлен в заказ.\n"
+            f"Хотите добавить ещё один товар? (всего можно до {MAX_ITEMS})"
+        )
+        rows.append([InlineKeyboardButton(text="➕ Добавить ещё товар", callback_data="item_add")])
+    else:
+        text = f"Добавлено максимальное количество товаров ({MAX_ITEMS}). Переходим к проверке заказа."
+    rows.append([InlineKeyboardButton(text="✅ Перейти к проверке", callback_data="item_done")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="order_back")])
+    await state.set_state(OrderForm.more)
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data == "item_add", OrderForm.more)
+async def item_add(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    items = data.get("items", [])
+    if len(items) >= MAX_ITEMS:
+        await callback.answer("Достигнуто максимальное количество товаров.", show_alert=True)
+        return
+    step = FIRST_ITEM_STEP
+    await state.update_data(step=step)
+    await state.set_state(STEP_ORDER[step])
+    await callback.message.edit_reply_markup()
+    await callback.message.answer(
+        f"Товар {len(items) + 1}.\n\n" + STEP_PROMPTS[STEP_ORDER[step]],
+        reply_markup=_step_keyboard(step),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "item_done", OrderForm.more)
+async def item_done(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup()
+    await _show_summary(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "order_back", OrderForm.more)
+async def order_back_from_more(callback: CallbackQuery, state: FSMContext):
+    """Назад с вопроса «добавить ещё товар?»: возвращаемся к количеству пар последнего товара."""
+    data = await state.get_data()
+    items = list(data.get("items", []))
+    if not items:
+        await callback.answer()
+        return
+    last = items.pop()
+    step = STEP_ORDER.index(OrderForm.qty)
+    await state.update_data(items=items, step=step, **last)
+    await state.set_state(OrderForm.qty)
+    await callback.message.edit_reply_markup()
+    await callback.message.answer(STEP_PROMPTS[OrderForm.qty], reply_markup=_step_keyboard(step))
+    await callback.answer()
+
+
+@dp.message(StateFilter(OrderForm.more, OrderForm.confirm), F.chat.type == "private")
+async def order_use_buttons(message: Message):
+    await message.answer(
+        "Пожалуйста, воспользуйтесь кнопками под сообщением выше. "
+        "Чтобы прервать оформление, напишите /cancel."
+    )
 
 
 @dp.callback_query(F.data.startswith("color:"), OrderForm.color)
@@ -370,17 +489,33 @@ async def order_color_pick(callback: CallbackQuery, state: FSMContext):
             os.path.join(CATALOG_DIR, filename),
             os.path.join(base_dir, filename),
         ]
-        path = next((p for p in candidates if os.path.exists(p)), candidates[0])
+        path = next((p for p in candidates if os.path.exists(p)), None)
+        if path:
+            photo = FSInputFile(path)
+        else:
+            # Файла нет на диске сервера — берём картинку по ссылке из репозитория GitHub
+            # (репозиторий должен быть публичным).
+            photo = GITHUB_RAW_BASE + quote(filename)
+            try:
+                logging.warning(
+                    "Файл %s не найден на диске (%s), содержимое папки: %s. "
+                    "Отправляю по ссылке GitHub.",
+                    filename,
+                    candidates,
+                    sorted(os.listdir(base_dir))[:30],
+                )
+            except OSError:
+                pass
         try:
             await callback.message.answer_photo(
-                FSInputFile(path),
+                photo,
                 caption=(
                     f"Каталог: {color}.\n"
                     "Диоптрии, доступные для каждой модели, указаны под названием."
                 ),
             )
         except (FileNotFoundError, TelegramAPIError) as e:
-            logging.error("Не удалось отправить каталог %s: %s", filename, e)
+            logging.error("Не удалось отправить каталог %s: %s", filename, _safe_err(e))
 
     if step >= len(STEP_ORDER):
         await _show_summary(callback.message, state)
@@ -397,6 +532,11 @@ async def order_color_pick(callback: CallbackQuery, state: FSMContext):
 async def order_back(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     step = data.get("step", 0)
+    if STEP_ORDER[step] == OrderForm.left_eye and data.get("items"):
+        await callback.message.edit_reply_markup()
+        await _show_more_prompt(callback.message, state)
+        await callback.answer()
+        return
     if step == 0:
         await callback.answer("Это первый вопрос анкеты.", show_alert=True)
         return
@@ -410,11 +550,8 @@ async def order_back(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "order_back", OrderForm.confirm)
 async def order_back_from_confirm(callback: CallbackQuery, state: FSMContext):
-    step = len(STEP_ORDER) - 1
-    await state.update_data(step=step)
-    await state.set_state(STEP_ORDER[step])
     await callback.message.edit_reply_markup()
-    await callback.message.answer(STEP_PROMPTS[STEP_ORDER[step]], reply_markup=_step_keyboard(step))
+    await _show_more_prompt(callback.message, state)
     await callback.answer()
 
 
@@ -424,11 +561,8 @@ async def _show_summary(message: Message, state: FSMContext):
         "Проверьте, пожалуйста, заказ:\n\n"
         f"Имя Фамилия: {data['full_name']}\n"
         f"Адрес: {data['address']}\n"
-        f"Телефон: {data['phone']}\n"
-        f"Диоптрии: {data['left_eye']} / {data['right_eye']}\n"
-        f"Цвет: {data['color']}\n"
-        f"Модель: {data['model']}\n"
-        f"Количество пар: {data['qty']}"
+        f"Телефон: {data['phone']}\n\n"
+        f"{_format_items(data.get('items', []))}"
     )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -445,7 +579,7 @@ async def _show_summary(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "order_redo", OrderForm.confirm)
 async def order_redo(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(step=0)
+    await state.set_data({"step": 0, "items": []})
     await state.set_state(STEP_ORDER[0])
     await callback.message.edit_reply_markup()
     await callback.message.answer(
@@ -463,6 +597,8 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
         "SELECT group_id FROM creators WHERE code = ?", (code,)
     ).fetchone()
 
+    items = data.get("items", [])
+    first = items[0] if items else {f: "" for f in ITEM_FIELDS}
     db.execute(
         "INSERT INTO orders(client_id, creator_code, full_name, address, phone, "
         "left_eye, right_eye, color, model, qty) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -472,14 +608,20 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
             data["full_name"],
             data["address"],
             data["phone"],
-            data["left_eye"],
-            data["right_eye"],
-            data["color"],
-            data["model"],
-            data["qty"],
+            first["left_eye"],
+            first["right_eye"],
+            first["color"],
+            first["model"],
+            first["qty"],
         ),
     )
     order_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    for it in items:
+        db.execute(
+            "INSERT INTO order_items(order_id, left_eye, right_eye, color, model, qty) "
+            "VALUES(?,?,?,?,?,?)",
+            (order_id, it["left_eye"], it["right_eye"], it["color"], it["model"], it["qty"]),
+        )
     db.commit()
 
     await state.clear()
@@ -489,7 +631,7 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
     )
 
     if creator and creator[0]:
-        text = _order_card_text(order_id, data, code, "new")
+        text = _order_card_text(order_id, data, code, "new", items)
         try:
             header = await bot.send_message(
                 creator[0], text, reply_markup=_order_status_keyboard(order_id)
@@ -501,7 +643,7 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext):
             )
             db.commit()
         except TelegramAPIError as e:
-            logging.error("Не удалось отправить заказ в группу: %s", e)
+            logging.error("Не удалось отправить заказ в группу: %s", _safe_err(e))
 
     await callback.answer()
 
@@ -515,18 +657,26 @@ STATUS_LABELS = {
 }
 
 
-def _order_card_text(order_id, data, code, status):
+def _order_card_text(order_id, data, code, status, items):
     return (
         f"{STATUS_LABELS.get(status, status)} · заказ №{order_id}\n"
         f"Клиент: {data['full_name']}\n"
         f"Телефон: {data['phone']}\n"
-        f"Адрес: {data['address']}\n"
-        f"Диоптрии: {data['left_eye']} / {data['right_eye']}\n"
-        f"Цвет: {data['color']}\n"
-        f"Модель: {data.get('model', '')}\n"
-        f"Количество пар: {data['qty']}\n"
+        f"Адрес: {data['address']}\n\n"
+        f"{_format_items(items)}\n\n"
         f"Код креатора: {code}"
     )
+
+
+def _load_items(order_id, legacy):
+    """Товары заказа из базы; для старых заказов (без order_items) — из колонок orders."""
+    rows = db.execute(
+        "SELECT left_eye, right_eye, color, model, qty FROM order_items "
+        "WHERE order_id = ? ORDER BY id",
+        (order_id,),
+    ).fetchall()
+    source = rows if rows else [legacy]
+    return [dict(zip(ITEM_FIELDS, r)) for r in source]
 
 
 def _order_status_keyboard(order_id):
@@ -575,13 +725,9 @@ async def order_status_change(callback: CallbackQuery):
         "full_name": row[2],
         "address": row[3],
         "phone": row[4],
-        "left_eye": row[5],
-        "right_eye": row[6],
-        "color": row[7],
-        "model": row[8],
-        "qty": row[9],
     }
-    text = _order_card_text(order_id, data, row[1], new_status)
+    items = _load_items(order_id, row[5:10])
+    text = _order_card_text(order_id, data, row[1], new_status, items)
     await callback.message.edit_text(text, reply_markup=_order_status_keyboard(order_id))
     await callback.answer(f"Статус обновлён: {STATUS_LABELS[new_status]}")
 
@@ -623,7 +769,7 @@ async def from_client(message: Message):
             reply_to_message_id=header.message_id,
         )
     except TelegramAPIError as e:
-        logging.error("Не удалось отправить в группу %s: %s", group_id, e)
+        logging.error("Не удалось отправить в группу %s: %s", group_id, _safe_err(e))
         await message.answer("Не удалось отправить сообщение. Попробуйте позже.")
         return
 
