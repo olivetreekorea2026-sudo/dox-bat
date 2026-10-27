@@ -364,7 +364,13 @@ async def order_color_pick(callback: CallbackQuery, state: FSMContext):
     # Присылаем страницу каталога с выбранным цветом (там же видны диоптрии по моделям).
     filename = COLOR_CATALOG_FILES.get(color)
     if filename:
-        path = os.path.join(CATALOG_DIR, filename)
+        # Ищем картинку в папке catalog, а если её там нет — рядом с bot.py.
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.join(CATALOG_DIR, filename),
+            os.path.join(base_dir, filename),
+        ]
+        path = next((p for p in candidates if os.path.exists(p)), candidates[0])
         try:
             await callback.message.answer_photo(
                 FSInputFile(path),
