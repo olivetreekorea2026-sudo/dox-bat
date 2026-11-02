@@ -9,7 +9,7 @@ Set BOT_TOKEN in the server environment, or create /home/container/.env:
 
 The existing bot.py, images, and requirements.txt remain unchanged.
 """
-
+# DOX Global deployment sync
 import os
 import runpy
 from pathlib import Path
