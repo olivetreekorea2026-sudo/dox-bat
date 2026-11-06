@@ -672,5 +672,179 @@ async def receipt_photo_or_regular_message(message: Message):
     )
 
 
+# ---------- Уведомления клиенту о подтверждённой оплате и отправке ----------
+# Фото платежа само по себе НЕ переводит заказ в статус "Оплачен".
+# Статусы меняет только администратор группы конкретного креатора.
+# Уведомление отправляется не более одного раза для каждого статуса;
+# при ошибке доставки повторное нажатие той же кнопки позволяет повторить попытку.
+dox.db.execute(
+    """CREATE TABLE IF NOT EXISTS status_notifications (
+        order_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(order_id, status)
+    )"""
+)
+dox.db.commit()
+
+_old_status_handlers = [
+    h for h in dox.dp.callback_query.handlers
+    if h.callback is dox.order_status_change
+]
+if len(_old_status_handlers) != 1:
+    raise RuntimeError("Не найден единственный обработчик статусов заказа в bot.py")
+dox.dp.callback_query.handlers.remove(_old_status_handlers[0])
+
+CUSTOMER_STATUS_MESSAGES = {
+    "paid": (
+        "✅ DOX Global — Оплата подтверждена!\n\n"
+        "💰 Оплата по заказу №{order_id} получена и проверена менеджером.\n"
+        "Спасибо за покупку! Ваш заказ готовится к отправке."
+    ),
+    "shipped": (
+        "📦 DOX Global — Заказ отправлен!\n\n"
+        "Ваш заказ №{order_id} передан в доставку.\n"
+        "🚚 Доставка бесплатная.\n"
+        "Спасибо, что выбрали DOX Global!"
+    ),
+}
+
+
+def _was_status_notification_sent(order_id: int, status: str) -> bool:
+    return bool(dox.db.execute(
+        "SELECT 1 FROM status_notifications WHERE order_id=? AND status=?",
+        (order_id, status),
+    ).fetchone())
+
+
+@dox.dp.callback_query(F.data.startswith("status:"))
+async def status_change_with_client_notice(callback: CallbackQuery):
+    try:
+        prefix, order_id_text, new_status = callback.data.split(":", 2)
+        order_id = int(order_id_text)
+        if prefix != "status" or new_status not in ("paid", "shipped", "cancelled"):
+            raise ValueError("invalid status")
+    except (ValueError, AttributeError):
+        await callback.answer("Некорректная кнопка", show_alert=True)
+        return
+
+    if not callback.message or callback.message.chat.type not in dox.GROUP_TYPES:
+        await callback.answer("Статус меняется только в группе менеджеров", show_alert=True)
+        return
+
+    group_id = callback.message.chat.id
+    order = dox.db.execute(
+        "SELECT client_id, creator_code, status, full_name, address, phone, "
+        "left_eye, right_eye, color, model FROM orders WHERE id=?",
+        (order_id,),
+    ).fetchone()
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+
+    client_id, creator_code, old_status = order[:3]
+    creator_group = dox.db.execute(
+        "SELECT group_id FROM creators WHERE code=?", (creator_code,)
+    ).fetchone()
+    if not creator_group or creator_group[0] != group_id:
+        await callback.answer("Это заказ другого креатора", show_alert=True)
+        return
+
+    try:
+        member = await dox.bot.get_chat_member(group_id, callback.from_user.id)
+    except TelegramAPIError as exc:
+        logging.error("Проверка администратора: %s", dox._safe_err(exc))
+        await callback.answer("Не удалось проверить права администратора", show_alert=True)
+        return
+    if member.status not in ("creator", "administrator"):
+        await callback.answer("Только администратор может менять статус", show_alert=True)
+        return
+
+    if old_status == "cancelled":
+        await callback.answer("Отменённый заказ нельзя подтверждать или отправлять", show_alert=True)
+        return
+    if old_status == "shipped" and new_status != "shipped":
+        await callback.answer("Заказ уже отправлен; изменение статуса назад запрещено", show_alert=True)
+        return
+    if new_status == "shipped" and old_status not in ("paid", "shipped"):
+        await callback.answer("Сначала подтвердите оплату кнопкой «Оплачен»", show_alert=True)
+        return
+    if new_status == "paid" and old_status not in ("new", "paid"):
+        await callback.answer("Невозможно подтвердить оплату для этого статуса", show_alert=True)
+        return
+
+    # Для новых заказов в виде сетов подтверждение оплаты возможно только
+    # после реальной загрузки фото/скриншота чека от клиента.
+    if new_status == "paid" and old_status == "new":
+        is_set = dox.db.execute(
+            "SELECT 1 FROM order_sets WHERE order_id=?", (order_id,)
+        ).fetchone()
+        if is_set:
+            proof = dox.db.execute(
+                "SELECT customer_claimed_at FROM payment_choices WHERE order_id=?",
+                (order_id,),
+            ).fetchone()
+            if not proof or not proof[0]:
+                await callback.answer(
+                    "Сначала клиент должен прикрепить скриншот оплаты", show_alert=True
+                )
+                return
+
+    if old_status != new_status:
+        dox.db.execute(
+            "UPDATE orders SET status=? WHERE id=?", (new_status, order_id)
+        )
+        dox.db.commit()
+        data = {"full_name": order[3], "address": order[4], "phone": order[5]}
+        items = dox._load_items(order_id, order[6:10])
+        new_card = dox._order_card_text(
+            order_id, data, creator_code, new_status, items,
+            dox._load_accessories(order_id),
+        )
+        try:
+            await callback.message.edit_text(
+                new_card, reply_markup=dox._order_status_keyboard(order_id)
+            )
+        except TelegramAPIError as exc:
+            logging.error(
+                "Не получилось обновить карточку заказа №%s: %s",
+                order_id, dox._safe_err(exc),
+            )
+
+    if new_status not in CUSTOMER_STATUS_MESSAGES:
+        await callback.answer("Статус заказа изменён: Отменён")
+        return
+
+    if _was_status_notification_sent(order_id, new_status):
+        await callback.answer("Статус установлен; клиент уже получил уведомление")
+        return
+
+    try:
+        await dox.bot.send_message(
+            client_id, CUSTOMER_STATUS_MESSAGES[new_status].format(order_id=order_id)
+        )
+    except TelegramAPIError as exc:
+        logging.error(
+            "Уведомление по заказу №%s (%s) не доставлено: %s",
+            order_id, new_status, dox._safe_err(exc),
+        )
+        await callback.answer(
+            "Статус сохранён, но клиент НЕ получил сообщение. "
+            "Проверьте, не заблокирован ли бот, и нажмите кнопку повторно.",
+            show_alert=True,
+        )
+        return
+
+    dox.db.execute(
+        "INSERT OR IGNORE INTO status_notifications(order_id,status) VALUES(?,?)",
+        (order_id, new_status),
+    )
+    dox.db.commit()
+    await callback.answer(
+        "Оплата подтверждена, клиент уведомлён" if new_status == "paid"
+        else "Отправка подтверждена, клиент уведомлён"
+    )
+
+
 if __name__ == "__main__":
     asyncio.run(dox.main())
