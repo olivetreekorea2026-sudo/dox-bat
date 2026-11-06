@@ -30,6 +30,45 @@ from aiogram.fsm.context import FSMContext  # noqa: E402
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup  # noqa: E402
 
 
+# --- DOX SETS: аксессуары не продаются отдельно ---
+# В оригинальном bot.py после выбора линз есть устаревший пункт
+# "Аксессуары" (раствор, дорожный контейнер, палочка для линз).
+# Не показываем его клиентам: подарки будут входить в выбранный сет,
+# но не должны добавляться как самостоятельные позиции заказа.
+# При этом таблицы в базе и старые заказы не удаляем.
+_removed_accessory_handlers = (
+    dox.item_done,
+    dox.acc_pick,
+    dox.acc_qty_button,
+    dox.acc_done,
+    dox.order_back_from_accessories,
+    dox.order_back_from_acc_qty,
+)
+for _handler in tuple(dox.dp.callback_query.handlers):
+    if _handler.callback in _removed_accessory_handlers:
+        dox.dp.callback_query.handlers.remove(_handler)
+
+# Запрещаем и ввод количества аксессуаров через сообщение.
+for _handler in tuple(dox.dp.message.handlers):
+    if _handler.callback is dox.acc_qty_text:
+        dox.dp.message.handlers.remove(_handler)
+
+
+async def item_done_no_accessories(callback: CallbackQuery, state: FSMContext):
+    """Сразу показываем проверку линз, без отдельной продажи аксессуаров."""
+    await state.update_data(accessories={}, acc_current=None)
+    await callback.message.edit_reply_markup()
+    await dox._show_summary(callback.message, state)
+    await callback.answer()
+
+
+dox.dp.callback_query.register(
+    item_done_no_accessories,
+    F.data == "item_done",
+    dox.OrderForm.more,
+)
+
+
 PAYMENT_METHODS = {
     "e9": (
         "🏦 Сбербанк / E9pay",
