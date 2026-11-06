@@ -2,7 +2,7 @@
 
 Preserves the existing bot.py order, creator-group and status logic.
 Removes separate accessory sales and displays all three payment methods
-in one message immediately after a customer confirms an order.
+in one message immediately after confirmation, then requests a photo receipt.
 
 Sensitive payment details and BOT_TOKEN belong in a private server .env,
 never in the public GitHub repository.
@@ -29,7 +29,8 @@ import bot as dox  # noqa: E402
 from aiogram import F  # noqa: E402
 from aiogram.exceptions import TelegramAPIError  # noqa: E402
 from aiogram.fsm.context import FSMContext  # noqa: E402
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup  # noqa: E402
+from aiogram.filters import StateFilter  # noqa: E402
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message  # noqa: E402
 
 
 # Remove the separate accessories ordering steps (gifts remain part of sets).
@@ -111,14 +112,15 @@ def payment_text(order_id: int) -> str:
         f"Email получателя: {value('PAY_PAYPAL_EMAIL')}\n\n"
         "🎁 Подарки в выбранном сете и доставка — бесплатно.\n"
         "⚠️ Сумму и валюту платежа необходимо подтвердить у менеджера до перевода.\n\n"
-        "После перевода нажмите «Я оплатил» и отправьте сюда квитанцию "
-        "или номер перевода. Менеджер проверит поступление средств."
+        "После перевода нажмите «📷 Прикрепить скриншот оплаты» и отправьте "
+        "в этот чат фотографию подтверждения перевода. "
+        "Менеджер проверит поступление средств."
     )
 
 
 def payment_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paydone:{order_id}")],
+        [InlineKeyboardButton(text="📷 Прикрепить скриншот оплаты", callback_data=f"proof:{order_id}")],
         [InlineKeyboardButton(text="💬 Связаться с менеджером", callback_data=f"operator:{order_id}")],
     ])
 
@@ -130,6 +132,16 @@ dox.db.execute(
          method TEXT NOT NULL,
          customer_claimed_at TEXT
        )"""
+)
+dox.db.commit()
+
+# An unfinished request to submit a receipt survives a bot restart.
+dox.db.execute(
+    """CREATE TABLE IF NOT EXISTS receipt_pending (
+        user_id INTEGER PRIMARY KEY,
+        order_id INTEGER NOT NULL,
+        requested_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )"""
 )
 dox.db.commit()
 
@@ -202,8 +214,9 @@ def owned_order(order_id: int, user_id: int):
     ).fetchone()
 
 
-@dox.dp.callback_query(F.data.startswith("paydone:"))
-async def customer_payment_claim(callback: CallbackQuery):
+@dox.dp.callback_query(F.data.startswith("proof:"))
+async def request_receipt_photo(callback: CallbackQuery):
+    """Request an actual image instead of accepting an unverified 'I paid' click."""
     try:
         order_id = int(callback.data.split(":", 1)[1])
     except (ValueError, AttributeError):
@@ -214,67 +227,152 @@ async def customer_payment_claim(callback: CallbackQuery):
     if not order:
         await callback.answer("Заказ не найден", show_alert=True)
         return
-    if order[2] in ("cancelled", "shipped"):
-        await callback.answer("Оплата этого заказа больше не ожидается", show_alert=True)
-        return
-    if order[2] == "paid":
-        await callback.answer("Менеджер уже подтвердил оплату", show_alert=True)
+    if order[2] in ("cancelled", "shipped", "paid"):
+        await callback.answer("Для этого заказа загрузка чека закрыта", show_alert=True)
         return
 
     payment = dox.db.execute(
-        "SELECT method, customer_claimed_at FROM payment_choices WHERE order_id = ?",
-        (order_id,),
+        "SELECT 1 FROM payment_choices WHERE order_id = ?", (order_id,)
     ).fetchone()
     if not payment:
-        await callback.answer("Реквизиты для этого заказа не выдавались", show_alert=True)
-        return
-    if payment[1]:
-        await callback.answer("Менеджер уже получил уведомление", show_alert=True)
-        return
-
-    creator = dox.db.execute(
-        "SELECT group_id FROM creators WHERE code = ?", (order[1],)
-    ).fetchone()
-    if not creator or not creator[0]:
-        await callback.answer("Группа менеджера недоступна", show_alert=True)
-        return
-
-    notification_text = (
-        f"💳 Клиент сообщил об оплате заказа №{order_id}\n"
-        f"Креатор: {order[1]}\n"
-        "Способ: E9pay / Western Union / MoneyGram / PayPal (не уточнён).\n"
-        "⚠️ Это НЕ подтверждение получения денег. "
-        "Проверьте платёж перед статусом «Оплачен»."
-    )
-    try:
-        sent = await dox.bot.send_message(
-            creator[0], notification_text,
-            reply_markup=dox._order_status_keyboard(order_id),
-        )
-    except TelegramAPIError as exc:
-        logging.error(
-            "Не удалось уведомить менеджера по заказу %s: %s",
-            order_id, dox._safe_err(exc),
-        )
-        await callback.answer("Не удалось уведомить менеджера. Повторите позже", show_alert=True)
+        await callback.answer("Сначала получите реквизиты оплаты", show_alert=True)
         return
 
     dox.db.execute(
-        "UPDATE payment_choices SET customer_claimed_at = CURRENT_TIMESTAMP WHERE order_id = ?",
-        (order_id,),
-    )
-    dox.db.execute(
-        "INSERT OR REPLACE INTO msg_map(group_id, message_id, client_id) VALUES (?, ?, ?)",
-        (creator[0], sent.message_id, callback.from_user.id),
+        """INSERT INTO receipt_pending(user_id, order_id, requested_at)
+           VALUES (?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(user_id) DO UPDATE
+           SET order_id=excluded.order_id, requested_at=CURRENT_TIMESTAMP""",
+        (callback.from_user.id, order_id),
     )
     dox.db.commit()
 
     await callback.message.answer(
-        "✅ Уведомление об оплате отправлено менеджеру.\n"
-        "Пришлите сюда квитанцию, скриншот или номер перевода.\n"
-        "Статус «Оплачен» появится после проверки поступления денег."
+        f"📷 Заказ №{order_id}: прикрепите скриншот оплаты.\n\n"
+        "Нажмите 📎 (или +) в Telegram и отправьте фото чека в этот чат. "
+        "Можно отправить скриншот изображением, как фото или файлом JPG/PNG.\n\n"
+        "Чек будет отправлен менеджеру вашего креатора. "
+        "Не присылайте пароли и коды подтверждения.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="Отменить загрузку чека", callback_data=f"proofcancel:{order_id}"
+        )]]),
     )
     await callback.answer()
+
+
+@dox.dp.callback_query(F.data.startswith("proofcancel:"))
+async def cancel_receipt_photo(callback: CallbackQuery):
+    try:
+        order_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, AttributeError):
+        await callback.answer("Неверная кнопка", show_alert=True)
+        return
+    dox.db.execute(
+        "DELETE FROM receipt_pending WHERE user_id=? AND order_id=?",
+        (callback.from_user.id, order_id),
+    )
+    dox.db.commit()
+    await callback.message.answer("Загрузка скриншота отменена. Чтобы отправить его, нажмите кнопку под реквизитами снова.")
+    await callback.answer()
+
+
+# The original private message handler forwards free-form messages to the creator.
+# Replace it with a wrapper so receipt images get the order number and status.
+_old_client_handlers = [
+    handler for handler in dox.dp.message.handlers
+    if handler.callback is dox.from_client
+]
+if len(_old_client_handlers) != 1:
+    raise RuntimeError("Не найден обработчик сообщений клиента в bot.py")
+dox.dp.message.handlers.remove(_old_client_handlers[0])
+
+
+def _image_receipt(message: Message) -> bool:
+    if message.photo:
+        return True
+    if message.document:
+        mime_type = (message.document.mime_type or "").lower()
+        file_name = (message.document.file_name or "").lower()
+        return mime_type.startswith("image/") or file_name.endswith(
+            (".jpg", ".jpeg", ".png", ".webp")
+        )
+    return False
+
+
+@dox.dp.message(F.chat.type == "private", StateFilter(None))
+async def receipt_photo_or_regular_message(message: Message):
+    pending = dox.db.execute(
+        "SELECT order_id FROM receipt_pending WHERE user_id=?", (message.from_user.id,)
+    ).fetchone()
+    if not pending:
+        # Preserve the original free-form messages and photo forwarding.
+        await dox.from_client(message)
+        return
+
+    order_id = pending[0]
+    order = owned_order(order_id, message.from_user.id)
+    if not order or order[2] in ("cancelled", "shipped", "paid"):
+        dox.db.execute("DELETE FROM receipt_pending WHERE user_id=?", (message.from_user.id,))
+        dox.db.commit()
+        await message.answer("Загрузка чека для этого заказа больше недоступна.")
+        return
+
+    if not _image_receipt(message):
+        await message.answer(
+            f"📷 Для заказа №{order_id} отправьте именно ФОТО или скриншот "
+            "в формате JPG/PNG. Текст не считается подтверждением оплаты. "
+            "Если хотите отменить загрузку, нажмите «Отменить загрузку чека» выше."
+        )
+        return
+
+    creator = dox.db.execute(
+        "SELECT group_id FROM creators WHERE code=?", (order[1],)
+    ).fetchone()
+    if not creator or not creator[0]:
+        await message.answer("Группа менеджера недоступна. Сохраните чек и повторите попытку позже.")
+        return
+
+    group_id = creator[0]
+    header_text = (
+        f"📷 Получен скриншот оплаты заказа №{order_id}\n"
+        f"Креатор: {order[1]}\n"
+        f"Клиент: {message.from_user.full_name} (ID: {message.from_user.id})\n\n"
+        "⚠️ Чек отправлен клиентом. Это НЕ подтверждение поступления денег. "
+        "Менеджер должен проверить перевод перед нажатием «Оплачен»."
+    )
+    try:
+        # A group header + native Telegram photo lets staff inspect the receipt.
+        header = await dox.bot.send_message(
+            group_id, header_text,
+            reply_markup=dox._order_status_keyboard(order_id),
+        )
+        photo = await dox.bot.copy_message(
+            group_id, message.chat.id, message.message_id,
+            reply_to_message_id=header.message_id,
+        )
+    except TelegramAPIError as exc:
+        logging.error(
+            "Не удалось отправить скриншот оплаты по заказу %s: %s",
+            order_id, dox._safe_err(exc),
+        )
+        await message.answer("Не удалось передать скриншот менеджеру. Повторите отправку фото позже.")
+        return
+
+    dox.db.execute(
+        "UPDATE payment_choices SET customer_claimed_at=CURRENT_TIMESTAMP WHERE order_id=?",
+        (order_id,),
+    )
+    for msg_id in (header.message_id, photo.message_id):
+        dox.db.execute(
+            "INSERT OR REPLACE INTO msg_map(group_id, message_id, client_id) VALUES(?, ?, ?)",
+            (group_id, msg_id, message.from_user.id),
+        )
+    dox.db.execute("DELETE FROM receipt_pending WHERE user_id=?", (message.from_user.id,))
+    dox.db.commit()
+    await message.answer(
+        f"✅ Скриншот оплаты заказа №{order_id} отправлен менеджеру.\n"
+        "После проверки поступления средств менеджер подтвердит оплату."
+    )
 
 
 if __name__ == "__main__":
