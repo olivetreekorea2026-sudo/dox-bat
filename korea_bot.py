@@ -240,11 +240,12 @@ def mark_paid(order_id: int) -> str:
         return "invalid"
 
 
-def mark_shipped(order_id: int, tracking: str) -> str:
+def mark_shipped(order_id: int) -> str:
+    """Mark a paid order shipped without requiring a carrier or tracking number."""
     with conn() as db:
-        cur = db.execute("""UPDATE orders SET status='shipped', tracking=?, shipped_at=?
+        cur = db.execute("""UPDATE orders SET status='shipped', shipped_at=?
             WHERE id=? AND status='paid'""",
-            (tracking, datetime.now(timezone.utc).isoformat(), order_id))
+            (datetime.now(timezone.utc).isoformat(), order_id))
         if cur.rowcount:
             return "ok"
         row = db.execute("SELECT status FROM orders WHERE id=?", (order_id,)).fetchone()
@@ -898,12 +899,24 @@ async def shipping_callback(call: CallbackQuery, bot: Bot):
     if order["status"] != "paid":
         await call.answer("Сначала подтвердите оплату.", show_alert=True)
         return
-    await call.answer()
-    await call.message.answer(
-        f"🚚 ТРЕК-НОМЕР ДЛЯ ЗАКАЗА №{order_id}\n"
-        "ОТВЕТЬТЕ на это сообщение (Reply) и напишите службу доставки и трек-номер.\n"
-        "Например: CJ대한통운 123456789012",
-    )
+    result = mark_shipped(order_id)
+    if result == "already":
+        await call.answer("Заказ уже отправлен.", show_alert=True)
+        return
+    if result != "ok":
+        await call.answer("Сначала подтвердите оплату.", show_alert=True)
+        return
+    await call.answer("Заказ отмечен как отправленный")
+    await call.message.answer(f"📦 Заказ №{order_id} отмечен как отправленный.")
+    try:
+        await bot.send_message(
+            order["buyer_id"],
+            f"📦 DOX Korea — ваш заказ №{order_id} отправлен!\n\n"
+            "Доставка по Южной Корее бесплатная.\n"
+            "Спасибо, что выбрали DOX Korea!"
+        )
+    except TelegramAPIError:
+        log.exception("Cannot notify buyer about shipped order #%s", order_id)
 
 
 @dp.callback_query(F.data.startswith("cancel:"))
@@ -935,33 +948,6 @@ async def manager_reply(message: Message, bot: Bot):
     if not message.from_user or not await group_admin(bot, message.chat.id, message.from_user.id):
         return
     quoted = message.reply_to_message
-    if quoted and quoted.from_user and quoted.from_user.id == bot.id and quoted.text:
-        match = re.match(r"🚚 ТРЕК-НОМЕР ДЛЯ ЗАКАЗА №(\d+)", quoted.text)
-        if match:
-            order_id = int(match.group(1))
-            order = get_order(order_id)
-            if not order or order["manager_chat_id"] != message.chat.id:
-                await message.answer("Заказ не найден в этой группе.")
-                return
-            tracking = (message.text or "").strip()
-            if len(tracking) < 4 or len(tracking) > 120 or "\n" in tracking:
-                await message.answer("Укажите службу доставки и трек-номер одной строкой (4–120 символов).")
-                return
-            status = mark_shipped(order_id, tracking)
-            if status == "ok":
-                await message.answer(f"📦 Заказ №{order_id} отмечен как отправленный.\nТрек: {tracking}")
-                try:
-                    await bot.send_message(order["buyer_id"],
-                                           f"📦 DOX Korea — ваш заказ №{order_id} отправлен!\n\n"
-                                           f"Номер отслеживания: {tracking}\n"
-                                           "Спасибо, что выбрали DOX Korea!")
-                except TelegramAPIError:
-                    log.exception("Cannot notify buyer about shipped order #%s", order_id)
-            elif status == "already":
-                await message.answer("Этот заказ уже отмечен как отправленный.")
-            else:
-                await message.answer("Сначала подтвердите оплату заказа.")
-            return
     order = order_from_reply(message.chat.id, quoted.message_id)
     if not order:
         return
