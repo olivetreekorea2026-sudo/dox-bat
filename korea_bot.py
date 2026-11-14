@@ -1,4 +1,4 @@
-"""DOX Korea: one 100,000 KRW set, 3 selected lens pairs, manual bank transfer.
+"""DOX Korea: 100,000 KRW base set + 10,000 KRW per selected AURA pair.
 
 For deployment: install requirements.txt, set BOT_TOKEN, KAKAO_BANK_ACCOUNT,
 KAKAO_BANK_HOLDER, run korea_bot.py and bind each creator group via /bind CREATOR01 or /bind CREATOR02.
@@ -53,14 +53,39 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("dox-korea")
 dp = Dispatcher()
 
+# Exact names only: AURORA GRAY and other similarly named models have no surcharge.
+AURA_SURCHARGE_KRW = 10_000
+AURA_MODELS = frozenset({
+    "AURA BLUE", "AURA OLIVE", "AURA CHOCO", "AURA BROWN", "AURA GRAY",
+})
+
+
+def format_krw(amount: int) -> str:
+    return f"{int(amount):,}".replace(",", " ")
+
+
+def aura_pair_count(pairs: list[dict]) -> int:
+    return sum(str(p.get("model", "")).strip().upper() in AURA_MODELS for p in pairs)
+
+
+def set_total_krw(pairs: list[dict]) -> int:
+    return SET_PRICE_KRW + AURA_SURCHARGE_KRW * aura_pair_count(pairs)
+
+
+def price_lines(pairs: list[dict]) -> str:
+    count = aura_pair_count(pairs)
+    return (f"Базовая стоимость: {format_krw(SET_PRICE_KRW)} ₩\n"
+            f"Доплата за AURA: {count} × {format_krw(AURA_SURCHARGE_KRW)} ₩ "
+            f"= {format_krw(count * AURA_SURCHARGE_KRW)} ₩\n"
+            f"💰 ИТОГО: {format_krw(set_total_krw(pairs))} ₩")
+
 
 class OrderFlow(StatesGroup):
     category = State()
     model = State()
     od = State()
     os = State()
-    first_name = State()
-    last_name = State()
+    full_name = State()
     phone = State()
     postal = State()
     address = State()
@@ -169,7 +194,7 @@ def create_order(buyer_id: int, creator_code: str, manager_chat_id: int, data: d
             (buyer_id, creator_code, manager_chat_id, data["first_name"], data["last_name"],
              data["phone"], data["postal"], data["address"],
              data["address_detail"], json.dumps(data["pairs"], ensure_ascii=False),
-             SET_PRICE_KRW, datetime.now(timezone.utc).isoformat()))
+             set_total_krw(data["pairs"]), datetime.now(timezone.utc).isoformat()))
         return int(cur.lastrowid)
 
 
@@ -245,7 +270,7 @@ def inline(rows):
 
 
 def start_keyboard():
-    return inline([[('🛍 Заказать PREMIUM SET 1 — 100 000 ₩', 'begin')]])
+    return inline([[('🛍 Заказать PREMIUM SET 1 — от 100 000 ₩', 'begin')]])
 
 
 def categories_keyboard(pair_number: int):
@@ -266,9 +291,11 @@ def manager_buttons(order_id: int):
     ])
 
 
-def pair_lines(pairs: list[dict]) -> str:
+def pair_lines(pairs: list[dict], show_aura_charge: bool = False) -> str:
     return "\n".join(
         f"{i}. {p['model']} — OD {p['od']} / OS {p['os']}"
+        + (f" (+{format_krw(AURA_SURCHARGE_KRW)} ₩ за AURA)"
+           if show_aura_charge and str(p['model']).strip().upper() in AURA_MODELS else "")
         for i, p in enumerate(pairs, 1)
     )
 
@@ -277,17 +304,17 @@ def order_review(data: dict) -> str:
     return (
         "🛍 DOX KOREA — ПРОВЕРЬТЕ ЗАКАЗ\n\n"
         f"Креатор: {data['creator_code']}\n"
-        "PREMIUM SET 1\n" + pair_lines(data["pairs"]) + "\n\n"
+        "PREMIUM SET 1\n" + pair_lines(data["pairs"], show_aura_charge=True) + "\n\n"
         "🎁 Сумочка DOX — в комплекте\n"
         "🎁 3 дорожных набора — в комплекте\n"
         "🎁 2 раствора по 150 мл — в комплекте\n"
         "🚚 Доставка по Южной Корее — бесплатно\n\n"
         f"Получатель: {data['first_name']} {data['last_name']}\n"
         f"Телефон: {data['phone']}\n"
-        f"Индекс: {data['postal']}\n"
+        f"Индекс: {data.get('postal') or 'Не указан'}\n"
         f"Адрес: {data['address']}\n"
         f"Уточнение адреса: {data['address_detail']}\n\n"
-        "💰 ИТОГО: 100 000 ₩\n\n"
+        + price_lines(data["pairs"]) + "\n\n"
         "Проверьте модель, диоптрии и адрес перед подтверждением."
     )
 
@@ -297,13 +324,13 @@ def manager_order_text(order) -> str:
     return (
         f"🆕 DOX KOREA — ЗАКАЗ №{order['id']}\n"
         f"Креатор: {order['creator_code'] or 'не указан'}\n"
-        "PREMIUM SET 1 — 100 000 ₩\n"
+        f"PREMIUM SET 1 — {format_krw(order['amount_krw'])} ₩\n"
         f"Клиент: {order['first_name']} {order['last_name']}\n"
         f"Телефон: {order['phone']}\n"
-        f"Индекс: {order['postal']}\n"
+        f"Индекс: {order['postal'] or 'Не указан'}\n"
         f"Адрес: {order['address']}\n"
         f"Детали: {order['address_detail']}\n\n"
-        "Линзы:\n" + pair_lines(pairs) + "\n\n"
+        "Линзы:\n" + pair_lines(pairs, show_aura_charge=(int(order["amount_krw"]) == set_total_krw(pairs))) + "\n\n"
         "Подарки: сумочка DOX, 3 дорожных набора, 2 раствора 150 мл.\n"
         f"ID клиента: {order['buyer_id']}\n"
         "Статус: ожидает скриншот оплаты.\n"
@@ -311,10 +338,10 @@ def manager_order_text(order) -> str:
     )
 
 
-def bank_text(order_id: int) -> str:
+def bank_text(order_id: int, amount_krw: int) -> str:
     return (
         f"✅ Заказ №{order_id} подтверждён!\n\n"
-        "💰 К оплате: 100 000 ₩\n"
+        f"💰 К оплате: {format_krw(amount_krw)} ₩\n"
         "🚚 Доставка по Южной Корее — бесплатно.\n\n"
         "🏦 Банковский перевод:\n"
         "Банк: Kakao Bank (카카오뱅크)\n"
@@ -349,8 +376,12 @@ async def next_pair(message: Message, state: FSMContext):
     data = await state.get_data()
     count = len(data.get("pairs", []))
     if count >= REQUIRED_PAIRS:
-        await state.set_state(OrderFlow.first_name)
-        await message.answer("✅ Вы выбрали все 3 пары.\n\nВведите ИМЯ латинскими буквами, например: ANNA")
+        await state.set_state(OrderFlow.full_name)
+        await message.answer(
+            "✅ Вы выбрали все 3 пары.\n\n"
+            "Введите ИМЯ И ФАМИЛИЮ одним сообщением, английскими буквами.\n"
+            "Например: ANNA IVANOVA"
+        )
         return
     number = count + 1
     await state.update_data(pair_number=number)
@@ -381,7 +412,10 @@ async def start(message: Message, state: FSMContext):
         return
     caption = (
         "🇰🇷 Добро пожаловать в DOX Korea!\n\n"
-        "🎁 PREMIUM SET 1 — 100 000 ₩\n"
+        "🎁 PREMIUM SET 1 — от 100 000 ₩\n"
+        "✨ Серия AURA (BLUE, OLIVE, CHOCO, BROWN, GRAY): "
+        "+10 000 ₩ за каждую выбранную пару.\n"
+        "Цена за 3 пары: от 100 000 до 130 000 ₩.\n\n"
         "• 3 пары линз на ваш выбор\n"
         "• Фирменная сумочка DOX\n"
         "• 3 дорожных набора (контейнер и щипчики)\n"
@@ -480,13 +514,18 @@ async def model_callback(call: CallbackQuery, state: FSMContext):
     if len(model.diopters) == 1:
         pairs = data["pairs"] + [{"model": model.name, "od": "0.00", "os": "0.00"}]
         await state.update_data(pairs=pairs, model_code=None)
-        await call.message.answer(f"✅ Пара {n}: {model.name}. Диоптрии 0.00 / 0.00 (только нулевые).")
+        extra = (f" Доплата за AURA: +{format_krw(AURA_SURCHARGE_KRW)} ₩."
+                 if model.name in AURA_MODELS else "")
+        await call.message.answer(f"✅ Пара {n}: {model.name}. Диоптрии 0.00 / 0.00 (только нулевые).{extra}"
+                                  f"\nТекущая цена сета: {format_krw(set_total_krw(pairs))} ₩.")
         await next_pair(call.message, state)
         return
     await state.set_state(OrderFlow.od)
     await call.message.answer(
-        f"👁 Пара {n}: {model.name}\n\n"
-        "Введите диоптрию ПРАВОГО глаза (OD).\n"
+        f"👁 Пара {n}: {model.name}\n"
+        + (f"✨ Доплата за AURA: +{format_krw(AURA_SURCHARGE_KRW)} ₩.\n"
+           if model.name in AURA_MODELS else "")
+        + "\nВведите диоптрию ПРАВОГО глаза (OD).\n"
         f"{diopter_hint(model)}\n"
         "Для линз без диоптрий введите 0.00."
     )
@@ -516,7 +555,10 @@ async def left_power(message: Message, state: FSMContext):
         return
     pairs = data["pairs"] + [{"model": model.name, "od": data["od"], "os": value}]
     await state.update_data(pairs=pairs, model_code=None, od=None)
-    await message.answer(f"✅ Сохранена пара {len(pairs)}: {model.name}, OD {data['od']} / OS {value}.")
+    extra = (f" Доплата за AURA: +{format_krw(AURA_SURCHARGE_KRW)} ₩."
+             if model.name in AURA_MODELS else "")
+    await message.answer(f"✅ Сохранена пара {len(pairs)}: {model.name}, OD {data['od']} / OS {value}.{extra}"
+                         f"\nТекущая цена сета: {format_krw(set_total_krw(pairs))} ₩.")
     await next_pair(message, state)
 
 
@@ -525,24 +567,28 @@ def valid_latin_name(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z]+(?:[ '\-][A-Za-z]+)*", value)) and len(value) <= 60
 
 
-@dp.message(OrderFlow.first_name, F.chat.type == "private")
-async def first_name(message: Message, state: FSMContext):
-    value = (message.text or "").strip()
-    if not valid_latin_name(value):
-        await message.answer("Введите имя английскими буквами (латиница), например ANNA.")
-        return
-    await state.update_data(first_name=value)
-    await state.set_state(OrderFlow.last_name)
-    await message.answer("Введите ФАМИЛИЮ английскими буквами, например IVANOVA.")
+def split_latin_full_name(value: str) -> tuple[str, str] | None:
+    """One customer input; preserve existing first_name/last_name DB fields."""
+    cleaned = " ".join(value.strip().split())
+    if not valid_latin_name(cleaned):
+        return None
+    parts = cleaned.split(" ", maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        return None
+    return parts[0], parts[1]
 
 
-@dp.message(OrderFlow.last_name, F.chat.type == "private")
-async def last_name(message: Message, state: FSMContext):
-    value = (message.text or "").strip()
-    if not valid_latin_name(value):
-        await message.answer("Введите фамилию латиницей, например IVANOVA.")
+@dp.message(OrderFlow.full_name, F.chat.type == "private")
+async def full_name(message: Message, state: FSMContext):
+    parsed = split_latin_full_name(message.text or "")
+    if parsed is None:
+        await message.answer(
+            "Введите имя и фамилию ОДНИМ сообщением английскими буквами.\n"
+            "Например: ANNA IVANOVA"
+        )
         return
-    await state.update_data(last_name=value)
+    first, last = parsed
+    await state.update_data(first_name=first, last_name=last)
     await state.set_state(OrderFlow.phone)
     await message.answer("Введите номер мобильного телефона в Корее, например 010-1234-5678.")
 
@@ -560,19 +606,46 @@ async def phone(message: Message, state: FSMContext):
         return
     await state.update_data(phone=value)
     await state.set_state(OrderFlow.postal)
-    await message.answer("Введите пятизначный почтовый индекс (우편번호), например 12345.")
+    await message.answer(
+        "Почтовый индекс (우편번호) — НЕОБЯЗАТЕЛЬНО.\n"
+        "Если знаете, введите 5 цифр, например 12345.\n"
+        "Если нет — нажмите «Пропустить индекс» или отправьте «-».",
+        reply_markup=inline([[('⏭ Пропустить индекс', 'skip_postal')]])
+    )
+
+
+async def proceed_to_address(message: Message, state: FSMContext, postal_value: str):
+    await state.update_data(postal=postal_value)
+    await state.set_state(OrderFlow.address)
+    await message.answer(
+        "Введите ПОЛНЫЙ адрес доставки на корейском языке (한글).\n"
+        "Например: 서울특별시 강남구 테헤란로 123"
+    )
+
+
+@dp.callback_query(F.data == "skip_postal")
+async def skip_postal(call: CallbackQuery, state: FSMContext):
+    if call.message.chat.type != "private" or await state.get_state() != OrderFlow.postal.state:
+        await call.answer("Кнопка больше неактуальна.", show_alert=True)
+        return
+    await call.answer()
+    await proceed_to_address(call.message, state, "")
 
 
 @dp.message(OrderFlow.postal, F.chat.type == "private")
 async def postal(message: Message, state: FSMContext):
     value = (message.text or "").strip()
-    if not re.fullmatch(r"\d{5}", value):
-        await message.answer("Почтовый индекс в Южной Корее должен состоять из 5 цифр.")
+    if value.lower() in ("-", "пропустить", "пропустить индекс", "skip"):
+        await proceed_to_address(message, state, "")
         return
-    await state.update_data(postal=value)
-    await state.set_state(OrderFlow.address)
-    await message.answer("Введите ПОЛНЫЙ адрес доставки на корейском языке (한글).\n"
-                         "Например: 서울특별시 강남구 테헤란로 123")
+    if not re.fullmatch(r"[0-9]{5}", value):
+        await message.answer(
+            "Если указываете почтовый индекс, нужны ровно 5 цифр.\n"
+            "Или нажмите «Пропустить индекс».",
+            reply_markup=inline([[('⏭ Пропустить индекс', 'skip_postal')]])
+        )
+        return
+    await proceed_to_address(message, state, value)
 
 
 @dp.message(OrderFlow.address, F.chat.type == "private")
@@ -639,7 +712,7 @@ async def confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
         return
     record_group_message(group, sent.message_id, order_id)
     await state.clear()
-    await call.message.answer(bank_text(order_id), reply_markup=inline([
+    await call.message.answer(bank_text(order_id, row["amount_krw"]), reply_markup=inline([
         [("📷 Прикрепить скриншот оплаты", f"receipt:{order_id}")]
     ]))
 
@@ -688,7 +761,7 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
     caption = (f"📷 ЧЕК ПО ЗАКАЗУ №{order_id}\n"
                f"Креатор: {order['creator_code'] or 'не указан'}\n"
                f"Клиент: {order['first_name']} {order['last_name']}\n"
-               "Проверьте поступление 100 000 ₩ на Kakao Bank.\n"
+               f"Проверьте поступление {format_krw(order['amount_krw'])} ₩ на Kakao Bank.\n"
                "После проверки нажмите «Оплачен» в заказе.\n"
                "Ответить клиенту можно ответом (Reply) на это сообщение.")
     try:
@@ -802,7 +875,7 @@ async def paid_callback(call: CallbackQuery, bot: Bot):
         try:
             await bot.send_message(order["buyer_id"],
                 f"✅ DOX Korea — оплата подтверждена!\n\n"
-                f"Оплата заказа №{order_id} на сумму 100 000 ₩ проверена менеджером.\n"
+                f"Оплата заказа №{order_id} на сумму {format_krw(order['amount_krw'])} ₩ проверена менеджером.\n"
                 "Ваш PREMIUM SET 1 готовится к отправке. Спасибо за покупку!")
         except TelegramAPIError:
             log.exception("Cannot notify buyer about paid order #%s", order_id)
@@ -911,7 +984,7 @@ async def catch_private(message: Message, state: FSMContext):
         await message.answer("Следуйте текущему шагу. Чтобы начать заново — /start. "
                              "Чтобы отменить заполнение — /cancel.")
     else:
-        await message.answer("Чтобы заказать PREMIUM SET 1 за 100 000 ₩, нажмите /start.")
+        await message.answer("Чтобы заказать PREMIUM SET 1 от 100 000 ₩, нажмите /start.")
 
 
 async def main():
