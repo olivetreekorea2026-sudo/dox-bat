@@ -135,18 +135,30 @@ def public_set_name(set_code: str) -> str:
     return SET_PUBLIC_NAMES.get(set_code, set_code)
 
 
-def set_total_usd(set_code: str, prices: list[int]) -> int:
-    """Start price plus model premiums over standard $33 lenses.
+def is_aura_item(item: dict) -> bool:
+    """Only the five AURA colours have a premium inside the 3-pair SET 1."""
+    model = re.sub(r"\s+", " ", (item.get("model") or "").upper().strip())
+    return bool(re.fullmatch(r"AURA (?:BLUE|OLIVE|CHOCO|BROWN|GRAY)", model))
 
-    A three-pair SET 1 starts at $110 (not the sum of 3*$33).
-    The $5 AURA supplement is added on top of the prior $35 AURA price.
+
+def set_total_usd(set_code: str, prices: list[int], items: list[dict]) -> int:
+    """2 pairs: sum model prices. 3-pair SET 1: $110 + $5 per AURA pair.
+
+    Price of one AURA pair is always $35 when purchased in the 2-pair option.
+    Prices of IRIS/SCLERA are reflected in the 2-pair total, but the 3-pair
+    SET 1 has a fixed base price regardless of those selected models.
     """
     if set_code not in SET_COUNTS or len(prices) != SET_COUNTS[set_code]:
         raise ValueError("Для расчёта цены необходимо выбрать все пары набора.")
+    if len(items) != len(prices):
+        raise ValueError("Количество моделей и цен не совпадает.")
     if any(price < PAIR_BASE_USD for price in prices):
         raise ValueError("Некорректная цена модели.")
-    return SET_STARTING_PRICES[set_code] + sum(price - PAIR_BASE_USD for price in prices)
-
+    if set_code == "SET 1":
+        return sum(prices)
+    return SET_STARTING_PRICES[set_code] + AURA_EXTRA_USD * sum(
+        1 for item in items if is_aura_item(item)
+    )
 
 SET_GIFTS = {
     "SET 1": ("1 раствор 150 мл", "2 дорожных набора"),
@@ -160,9 +172,9 @@ def unit_price_usd(item: dict) -> int:
     model = re.sub(r"\s+", " ", (item.get("model") or "").upper().strip())
     if not model:
         raise ValueError("Укажите точное название модели линз.")
-    # $35 AURA model price plus $5 per AURA pair (new promotion).
-    if re.match(r"^AURA\s+(BLUE|GRAY|OLIVE|CHOCO|BROWN)(?:\b|$)", model):
-        return 35 + AURA_EXTRA_USD
+    # AURA is $35 per pair; the +$5 surcharge applies ONLY to the 3-pair SET 1.
+    if is_aura_item({"model": model}):
+        return 35
     if model == "AURA":
         raise ValueError("Уточните цвет Aura: Blue, Gray, Olive, Choco или Brown.")
     # Accept 3/03 and 5/05 spelling for the same Iris model.
@@ -181,21 +193,27 @@ def set_receipt_text(set_code: str, items: list, prices: list) -> str:
     gifts = "\n".join(f"🎁 {x} — бесплатно" for x in SET_GIFTS[set_code])
     lines = [f"🛍 DOX Global — {public_set_name(set_code)}"]
     for i, (item, price) in enumerate(zip(items, prices), 1):
+        # Do not suggest the individual list prices are charged on top of a set.
+        unit_label = f" — {price} $" if set_code == "SET 1" else ""
         lines.append(
-            f"{i}. {item.get('model', '').strip()} | {item.get('color', '')} — {price} $\n"
+            f"{i}. {item.get('model', '').strip()} | {item.get('color', '')}{unit_label}\n"
             f"    Диоптрии: L {item.get('left_eye', '')} / R {item.get('right_eye', '')}"
         )
-    base = SET_STARTING_PRICES[set_code]
-    premium = sum(price - PAIR_BASE_USD for price in prices)
-    lines.extend((gifts, "🚚 Доставка — бесплатно", f"💵 Базовая цена набора: {base} $"))
-    if premium:
-        lines.append(f"💵 Доплата за выбранные модели: +{premium} $")
-    if any(re.match(r"^AURA\s+(BLUE|GRAY|OLIVE|CHOCO|BROWN)(?:\b|$)",
-                    (item.get("model") or "").upper().strip()) for item in items):
-        lines.append("✨ Для каждой пары AURA учтена доплата +5 $ сверх цены модели.")
-    lines.append(f"💵 ИТОГО: {set_total_usd(set_code, prices)} USD")
+    lines.append(gifts)
+    lines.append("🚚 Доставка — бесплатно")
+    if set_code == "SET 1":
+        # 2 selected pairs cost exactly the sum of the chosen model list prices.
+        lines.append("💵 Стоимость 2 пар по выбранным моделям")
+        lines.append("✨ AURA: 35 $ за пару, без дополнительной наценки")
+    else:
+        aura_count = sum(is_aura_item(item) for item in items)
+        lines.append("💵 Стоимость SET 1 (3 пары): 110 $")
+        if aura_count:
+            lines.append(f"✨ Доплата за AURA: {aura_count} × 5 $ = +{aura_count * AURA_EXTRA_USD} $")
+        else:
+            lines.append("✨ Доплата за AURA: 0 $")
+    lines.append(f"💵 ИТОГО: {set_total_usd(set_code, prices, items)} USD")
     return "\n".join(lines)
-
 
 def _set_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -212,8 +230,9 @@ async def show_set_choice(message: Message):
         "🎁 SET 1: 3 пары линз + 2 раствора по 150 мл + 3 дорожных набора "
         "+ солнцезащитный крем — от 110 $.\n\n"
         "✨ Хотите добавить серию AURA (BLUE, OLIVE, CHOCO, BROWN, GRAY)?\n"
-        "Каждая пара AURA в наборе — +5 $ к цене модели.\n\n"
-        "💵 Цена зависит от моделей линз (33 / 35 / 55 $ за пару; AURA 35 + 5 = 40 $).\n"
+        "При выборе 2 пар AURA стоит 35 $ за пару, без доплаты.\n"
+        "В SET 1 за 110 $ каждая пара AURA увеличивает цену сета на 5 $.\n\n"
+        "💵 При выборе 2 пар цена зависит от моделей (33 / 35 / 55 $ за пару).\n"
         "🎁 Все аксессуары в комплекте бесплатно.\n"
         "🚚 Доставка бесплатная, возможность отправки в вашу страну "
         "подтверждает менеджер.\n\n"
@@ -517,7 +536,7 @@ async def order_confirm_and_show_payments(callback: CallbackQuery, state: FSMCon
     except ValueError as exc:
         await callback.answer(str(exc), show_alert=True)
         return
-    total = set_total_usd(set_code, prices)
+    total = set_total_usd(set_code, prices, items)
     # The original order sender uses the same coroutine context while constructing
     # the initial creator-group notification, before set metadata is persisted.
     token = _confirming_set.set((set_code, total, prices))
@@ -1068,8 +1087,9 @@ async def global_choose_set(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         f"✅ Вы выбрали {public_set_name(selected)}.\n"
         f"Необходимо выбрать {SET_COUNTS[selected]} пары линз.\n"
-        f"Базовая стоимость набора: {SET_STARTING_PRICES[selected]} $.\n"
-        "После выбора линз бот попросит данные доставки.\n"
+        + ("Стоимость двух пар — сумма цен выбранных моделей.\n" if selected == "SET 1"
+           else "Стоимость SET 1 — 110 $ + 5 $ за каждую выбранную пару AURA.\n")
+        + "После выбора линз бот попросит данные доставки.\n"
         "Отменить заполнение: /cancel"
     )
     await global_next_pair(callback.message, state)
@@ -1156,12 +1176,15 @@ async def global_select_model(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.update_data(model_code=model_code)
     price = unit_price_usd({"model": model.name})
+    set_code = data.get("set_code")
+    price_description = (f"Цена пары: {price} $." if set_code == "SET 1" else
+                         f"SET 1: 110 $ + 5 $ за каждую пару AURA (модель {model.name}).")
     if model.diopters == ("0.00",):
         await global_add_completed_pair(callback.message, state, model.name, "0.00", "0.00")
         return
     await state.set_state(GlobalOrderFlow.od)
     await callback.message.answer(
-        f"👁 Пара {pair_number}: {model.name} — {price} $\n"
+        f"👁 Пара {pair_number}: {model.name}\n{price_description}\n"
         "Введите диоптрию ПРАВОГО глаза (OD).\n"
         f"{global_diopter_hint(model)}"
     )
@@ -1185,12 +1208,22 @@ async def global_add_completed_pair(message: Message, state: FSMContext,
     })
     set_code = data["set_code"]
     await state.update_data(items=items, model_code=None, od=None)
+    if set_code == "SET 1":
+        price_message = (
+            f"Цена пары: {unit_price_usd(items[-1])} $.\n"
+            f"Стоимость выбранных пар: {global_current_total(items)} $."
+        )
+    else:
+        aura_count = sum(is_aura_item(item) for item in items)
+        price_message = (
+            f"Базовая цена SET 1: 110 $.\n"
+            f"Доплата за AURA: {aura_count} × 5 $ = {aura_count * 5} $.\n"
+            f"Текущая цена SET 1: {110 + aura_count * 5} $."
+        )
     await message.answer(
         f"✅ Пара {len(items)} из {SET_COUNTS[set_code]}: {model_name}.\n"
         f"Диоптрии: OD {od} / OS {os_}.\n"
-        f"Цена пары: {unit_price_usd(items[-1])} $.\n"
-        f"Сумма цен выбранных пар (это ещё не итог набора): {global_current_total(items)} $.\n"
-        f"Базовая стоимость полного набора: {SET_STARTING_PRICES[set_code]} $."
+        + price_message
     )
     await global_next_pair(message, state)
 
@@ -1383,7 +1416,7 @@ async def global_cancel_order(message: Message, state: FSMContext):
 
 # Lightweight on-server version check. Use /doxversion in @DOXGlobalBot
 # to distinguish an installed file from an older deployment.
-GLOBAL_UI_VERSION = "DOX Global • новые наборы и AURA +5 USD • 23.11.2026 v3"
+GLOBAL_UI_VERSION = "DOX Global • AURA 35 USD для 2 пар, SET 1 +5 USD • 23.11.2026 v4"
 
 
 @dox.dp.message(GlobalCommand("doxversion"), F.chat.type == "private")
@@ -1409,9 +1442,10 @@ class GlobalWelcomeMenuMiddleware(BaseMiddleware):
                 await event.answer(
                     "🌍 Добро пожаловать в DOX Global!\n"
                     "🛍 Выберите набор: 2 пары от 66 $ или SET 1 (3 пары) от 110 $.\n"
-                    "✨ AURA BLUE / OLIVE / CHOCO / BROWN / GRAY: +5 $ к цене модели.\n"
-                    "🎁 Все подарки и международная доставка бесплатны.\n"
-                    "Цены: обычные линзы 33 $, IRIS 35 $, SCLERA 55 $, AURA 40 $.\n"
+                    "✨ AURA BLUE / OLIVE / CHOCO / BROWN / GRAY: 35 $ при выборе 2 пар.\n"
+                    "🎁 В SET 1 за 110 $ каждая пара AURA добавляет 5 $.\n"
+                    "Все подарки и международная доставка бесплатны.\n"
+                    "При выборе 2 пар: обычные 33 $, IRIS 35 $, SCLERA 55 $, AURA 35 $.\n"
                     f"Код вашего продавца: {creator}",
                     reply_markup=_set_keyboard(),
                 )
