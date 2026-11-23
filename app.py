@@ -1,6 +1,3 @@
-
-
-
 """DOX Global Telegram bot launcher.
 
 Preserves the existing bot.py order, creator-group and status logic.
@@ -97,7 +94,3 @@ async def item_done_no_accessories(callback: CallbackQuery, state: FSMContext):
     # Old inline buttons must never bypass the mandatory set size.
     data = await state.get_data()
     needed = SET_COUNTS.get(data.get("set_code"))
-
-
-
-
