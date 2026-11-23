@@ -53,8 +53,7 @@ def _set_international_shipping_prompts():
                 "ОДНИМ сообщением:\n"
                 "страна, город, улица, дом, квартира (если есть), почтовый индекс.\n\n"
                 "Пример: Kazakhstan, Almaty, Abay Ave 10, Apt 5, 050000.\n"
-                "Проверьте адрес перед подтверждением заказа. Если индекса нет, "
-                "уточните у менеджера, возможна ли доставка без него."
+                "📮 Почтовый индекс — обязательное поле. Пропустить его нельзя."
             )
         elif "телефон" in normalized:
             prompts[state] = (
@@ -530,6 +529,16 @@ async def order_confirm_and_show_payments(callback: CallbackQuery, state: FSMCon
     items = data.get("items", [])
     if set_code not in SET_COUNTS or len(items) != SET_COUNTS[set_code]:
         await callback.answer("Для покупки выберите все пары выбранного набора.", show_alert=True)
+        return
+    if not global_valid_postal((data.get("postal") or "").strip()):
+        await state.set_state(GlobalOrderFlow.postal)
+        await callback.answer(
+            "📮 Почтовый индекс обязателен. Введите его перед подтверждением заказа.",
+            show_alert=True,
+        )
+        await callback.message.answer(
+            "📮 Введите почтовый индекс сообщением. Без индекса заказ не оформляется."
+        )
         return
     try:
         prices = [unit_price_usd(it) for it in items]
@@ -1280,6 +1289,12 @@ def global_latin_text(value: str, min_length: int = 2) -> bool:
             and re.search(r"[\u0400-\u052F\uAC00-\uD7AF]", value) is None)
 
 
+def global_valid_postal(value: str) -> bool:
+    """Mandatory international postal code: 2–16 Latin letters/digits,
+    with optional internal spaces or hyphens (e.g. SW1A 1AA / 12345)."""
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 -]{0,14}[A-Za-z0-9]", value))
+
+
 @dox.dp.message(GlobalOrderFlow.full_name, F.chat.type == "private")
 async def global_recipient_name(message: Message, state: FSMContext):
     name = (message.text or "").strip()
@@ -1322,16 +1337,17 @@ async def global_city(message: Message, state: FSMContext):
     await state.update_data(city=value)
     await state.set_state(GlobalOrderFlow.postal)
     await message.answer(
-        "📮 Введите почтовый индекс для международной доставки.\n"
-        "Если почтового индекса нет, нажмите «⏭ Пропустить индекс».\n"
-        "Некоторые страны и службы доставки требуют индекс.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⏭ Пропустить индекс", callback_data="gpost:skip")]
-        ]),
+        "📮 Введите ПОЧТОВЫЙ ИНДЕКС получателя.\n"
+        "Это обязательное поле для международного заказа, пропустить нельзя.\n"
+        "Примеры: 10115, SW1A 1AA, 050000."
     )
 
 
 async def global_to_street(message: Message, state: FSMContext, postal: str):
+    if not global_valid_postal(postal):
+        await state.set_state(GlobalOrderFlow.postal)
+        await message.answer("📮 Почтовый индекс обязателен. Введите индекс, чтобы продолжить заказ.")
+        return
     await state.update_data(postal=postal)
     await state.set_state(GlobalOrderFlow.street)
     await message.answer(
@@ -1343,20 +1359,25 @@ async def global_to_street(message: Message, state: FSMContext, postal: str):
 @dox.dp.message(GlobalOrderFlow.postal, F.chat.type == "private")
 async def global_postal(message: Message, state: FSMContext):
     value = (message.text or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9 -]{2,16}", value):
-        await message.answer("Введите индекс (буквы/цифры, до 16 символов) или нажмите «Пропустить индекс».")
+    if not global_valid_postal(value):
+        await message.answer(
+            "📮 Почтовый индекс обязателен. Введите индекс латиницей/цифрами "
+            "(2–16 символов). Примеры: 10115, SW1A 1AA. Пропустить нельзя."
+        )
         return
     await global_to_street(message, state, value)
 
 
 @dox.dp.callback_query(F.data == "gpost:skip")
 async def global_postal_skip(callback: CallbackQuery, state: FSMContext):
+    # A buyer may press a previously sent button after a deployment.
+    # Reject it instead of allowing any bypass of the mandatory postal step.
     if await state.get_state() != GlobalOrderFlow.postal.state:
         await callback.answer("Кнопка устарела.", show_alert=True)
         return
-    await callback.answer()
-    await callback.message.edit_reply_markup()
-    await global_to_street(callback.message, state, "")
+    await callback.answer(
+        "📮 Индекс обязателен. Введите его сообщением в чат.", show_alert=True
+    )
 
 
 async def global_show_review(message: Message, state: FSMContext):
@@ -1367,6 +1388,13 @@ async def global_show_review(message: Message, state: FSMContext):
     if set_code not in SET_COUNTS or len(items) != SET_COUNTS[set_code]:
         await state.clear()
         await message.answer("Набор заполнен не полностью. Начните заказ заново: /order")
+        return
+    if not global_valid_postal((data.get("postal") or "").strip()):
+        await state.set_state(GlobalOrderFlow.postal)
+        await message.answer(
+            "📮 Для оформления международного заказа укажите почтовый индекс. "
+            "Без него подтвердить заказ нельзя."
+        )
         return
     try:
         prices = [unit_price_usd(item) for item in items]
@@ -1396,9 +1424,11 @@ async def global_street(message: Message, state: FSMContext):
         await message.answer("Введите улицу, дом и квартиру латиницей, например Friedrichstrasse 10, Apt 5")
         return
     data = await state.get_data()
-    postcode = data.get("postal", "")
-    if not postcode:
-        postcode = "без индекса (уточнить возможность доставки)"
+    postcode = (data.get("postal") or "").strip()
+    if not global_valid_postal(postcode):
+        await state.set_state(GlobalOrderFlow.postal)
+        await message.answer("📮 Почтовый индекс обязателен. Сначала введите индекс.")
+        return
     combined_address = (
         f"{data['country']}, {data['city']}, {postcode}, {street}"
     )
@@ -1416,7 +1446,7 @@ async def global_cancel_order(message: Message, state: FSMContext):
 
 # Lightweight on-server version check. Use /doxversion in @DOXGlobalBot
 # to distinguish an installed file from an older deployment.
-GLOBAL_UI_VERSION = "DOX Global • AURA 35 USD для 2 пар, SET 1 +5 USD • 23.11.2026 v4"
+GLOBAL_UI_VERSION = "DOX Global • обязательный индекс • 23.11.2026 v5"
 
 
 @dox.dp.message(GlobalCommand("doxversion"), F.chat.type == "private")
