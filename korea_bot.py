@@ -1,4 +1,4 @@
-"""DOX Korea: 100,000 KRW base set + 10,000 KRW per selected AURA pair.
+"""DOX Korea: 100,000 KRW base set + 5,000 KRW per selected AURA pair.
 
 For deployment: install requirements.txt, set BOT_TOKEN, KAKAO_BANK_ACCOUNT,
 KAKAO_BANK_HOLDER, run korea_bot.py and bind each creator group via /bind CREATOR01 or /bind CREATOR02.
@@ -54,7 +54,7 @@ log = logging.getLogger("dox-korea")
 dp = Dispatcher()
 
 # Exact names only: AURORA GRAY and other similarly named models have no surcharge.
-AURA_SURCHARGE_KRW = 10_000
+AURA_SURCHARGE_KRW = 5_000
 AURA_MODELS = frozenset({
     "AURA BLUE", "AURA OLIVE", "AURA CHOCO", "AURA BROWN", "AURA GRAY",
 })
@@ -271,7 +271,7 @@ def inline(rows):
 
 
 def start_keyboard():
-    return inline([[('🛍 Заказать PREMIUM SET 1 — от 100 000 ₩', 'begin')]])
+    return inline([[('🛍 Заказать PREMIUM SET 1', 'begin')]])
 
 
 def categories_keyboard(pair_number: int):
@@ -413,10 +413,10 @@ async def start(message: Message, state: FSMContext):
         return
     caption = (
         "🇰🇷 Добро пожаловать в DOX Korea!\n\n"
-        "🎁 PREMIUM SET 1 — от 100 000 ₩\n"
-        "✨ Серия AURA (BLUE, OLIVE, CHOCO, BROWN, GRAY): "
-        "+10 000 ₩ за каждую выбранную пару.\n"
-        "Цена за 3 пары: от 100 000 до 130 000 ₩.\n\n"
+        "🎁 PREMIUM SET 1 — 3 пары за 100 000 ₩\n\n"
+        "✨ Хотите добавить серию AURA (BLUE, OLIVE, CHOCO, BROWN, GRAY)?\n"
+        "Каждая пара AURA в наборе — +5 000 ₩ к базовой цене.\n"
+        "Стоимость сета: от 100 000 до 115 000 ₩.\n\n"
         "• 3 пары линз на ваш выбор\n"
         "• Фирменная сумочка DOX\n"
         "• 3 дорожных набора (контейнер и щипчики)\n"
