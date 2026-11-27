@@ -428,14 +428,12 @@ def _order_card_with_set(order_id, data, code, status, items, accessories=None):
 dox._order_card_text = _order_card_with_set
 
 
-# Payment details: configured only in the private .env on Silly Development.
+# E9pay and PayPal credentials are read from the PRIVATE .env on Silly Development.
+# ThePayBill is a public checkout URL provided by the business; no secret is required.
+THEPAYBILL_URL = "https://www.thepaybill.co.kr/bill/13089?o=1"
 REQUIRED_PAYMENT_KEYS = (
     "PAY_E9PAY_NUMBER",
     "PAY_E9PAY_NAME",
-    "PAY_TRANSFER_LAST_NAME",
-    "PAY_TRANSFER_FIRST_NAME",
-    "PAY_TRANSFER_PHONE",
-    "PAY_TRANSFER_CITY",
     "PAY_PAYPAL_EMAIL",
 )
 
@@ -465,15 +463,13 @@ def payment_text(order_id: int) -> str:
         "Способ получения: E9pay number\n"
         f"Номер E9pay: {value('PAY_E9PAY_NUMBER')}\n"
         f"Получатель: {value('PAY_E9PAY_NAME')}\n\n"
-        "2️⃣ Western Union / MoneyGram\n"
-        f"Фамилия: {value('PAY_TRANSFER_LAST_NAME')}\n"
-        f"Имя: {value('PAY_TRANSFER_FIRST_NAME')}\n"
-        f"Телефон: {value('PAY_TRANSFER_PHONE')}\n"
-        f"Город: {value('PAY_TRANSFER_CITY')}\n"
-        "Страна: South Korea\n\n"
+        "2️⃣ ThePayBill — оплата по ссылке\n"
+        f"{THEPAYBILL_URL}\n"
+        "Откройте ссылку или нажмите кнопку «💳 Оплатить через ThePayBill» ниже.\n\n"
         "3️⃣ PayPal\n"
         f"Email получателя: {value('PAY_PAYPAL_EMAIL')}\n\n"
-        "Стоимость заказа указана в USD. Если сервис принимает другую валюту, "
+        "Стоимость заказа указана в USD. На странице ThePayBill перед оплатой "
+        "проверьте назначение платежа и сумму; если сервис принимает другую валюту, "
         "согласуйте курс и сумму перевода с менеджером заранее. "
         "После перевода нажмите «📷 Прикрепить скриншот оплаты». "
         "Менеджер проверит поступление средств."
@@ -482,6 +478,7 @@ def payment_text(order_id: int) -> str:
 
 def payment_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить через ThePayBill", url=THEPAYBILL_URL)],
         [InlineKeyboardButton(text="📷 Прикрепить скриншот оплаты", callback_data=f"proof:{order_id}")],
         [InlineKeyboardButton(text="💬 Связаться с менеджером", callback_data=f"operator:{order_id}")],
     ])
@@ -1620,7 +1617,7 @@ async def global_cancel_order(message: Message, state: FSMContext):
 
 # Lightweight on-server version check. Use /doxversion in @DOXGlobalBot
 # to distinguish an installed file from an older deployment.
-GLOBAL_UI_VERSION = "DOX Global • кнопка Назад на каждом шаге • 27.11.2026 v6"
+GLOBAL_UI_VERSION = "DOX Global • оплата ThePayBill • 27.11.2026 v7"
 
 
 @dox.dp.message(GlobalCommand("doxversion"), F.chat.type == "private")
