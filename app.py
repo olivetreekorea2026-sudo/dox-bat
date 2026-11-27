@@ -537,7 +537,8 @@ async def order_confirm_and_show_payments(callback: CallbackQuery, state: FSMCon
             show_alert=True,
         )
         await callback.message.answer(
-            "📮 Введите почтовый индекс сообщением. Без индекса заказ не оформляется."
+            "📮 Введите почтовый индекс сообщением. Без индекса заказ не оформляется.",
+            reply_markup=global_back_keyboard("postal"),
         )
         return
     try:
@@ -1021,12 +1022,20 @@ def global_catalog_image_path(category: str) -> Path | None:
     return None
 
 
+def global_back_keyboard(stage: str) -> InlineKeyboardMarkup:
+    """A back button tied to the expected step. Old messages cannot skip steps."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"gprev:{stage}")],
+    ])
+
+
 def global_category_keyboard(set_code: str, pair_number: int):
     rows = []
     for category, (title, _filename) in GLOBAL_CATEGORIES.items():
         rows.append([InlineKeyboardButton(
             text=title, callback_data=f"gcat:{pair_number}:{category}",
         )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="gprev:category")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1035,7 +1044,7 @@ def global_model_keyboard(pair_number: int, category: str):
         [InlineKeyboardButton(text=model.name, callback_data=f"gmodel:{pair_number}:{model.code}")]
         for model in GLOBAL_BY_CATEGORY[category]
     ]
-    rows.append([InlineKeyboardButton(text="◀️ К выбору цвета", callback_data=f"gback:{pair_number}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="gprev:model")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1057,7 +1066,8 @@ async def global_next_pair(message: Message, state: FSMContext):
         await message.answer(
             "✅ Вы выбрали все пары линз.\n\n"
             "Введите ИМЯ И ФАМИЛИЮ одним сообщением латиницей.\n"
-            "Пример: ANNA IVANOVA"
+            "Пример: ANNA IVANOVA",
+            reply_markup=global_back_keyboard("full_name"),
         )
         return
     pair_number = len(items) + 1
@@ -1195,7 +1205,8 @@ async def global_select_model(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         f"👁 Пара {pair_number}: {model.name}\n{price_description}\n"
         "Введите диоптрию ПРАВОГО глаза (OD).\n"
-        f"{global_diopter_hint(model)}"
+        f"{global_diopter_hint(model)}",
+        reply_markup=global_back_keyboard("od"),
     )
 
 
@@ -1247,12 +1258,18 @@ async def global_od(message: Message, state: FSMContext):
         return
     value = global_normalize_diopter(message.text or "", model)
     if value is None:
-        await message.answer(f"Уточните диоптрию OD для {model.name}.\n{global_diopter_hint(model)}")
+        await message.answer(
+            f"Уточните диоптрию OD для {model.name}.\n{global_diopter_hint(model)}",
+            reply_markup=global_back_keyboard("od"),
+        )
         return
     await state.update_data(od=value)
     await state.set_state(GlobalOrderFlow.os)
-    await message.answer(f"Введите диоптрию ЛЕВОГО глаза (OS) для {model.name}.\n"
-                         + global_diopter_hint(model))
+    await message.answer(
+        f"Введите диоптрию ЛЕВОГО глаза (OS) для {model.name}.\n"
+        + global_diopter_hint(model),
+        reply_markup=global_back_keyboard("os"),
+    )
 
 
 @dox.dp.message(GlobalOrderFlow.os, F.chat.type == "private")
@@ -1265,7 +1282,10 @@ async def global_os(message: Message, state: FSMContext):
         return
     value = global_normalize_diopter(message.text or "", model)
     if value is None:
-        await message.answer(f"Уточните диоптрию OS для {model.name}.\n{global_diopter_hint(model)}")
+        await message.answer(
+            f"Уточните диоптрию OS для {model.name}.\n{global_diopter_hint(model)}",
+            reply_markup=global_back_keyboard("os"),
+        )
         return
     await global_add_completed_pair(message, state, model.name, data.get("od", "0.00"), value)
 
@@ -1299,60 +1319,86 @@ def global_valid_postal(value: str) -> bool:
 async def global_recipient_name(message: Message, state: FSMContext):
     name = (message.text or "").strip()
     if not global_valid_name(name):
-        await message.answer("Введите ИМЯ И ФАМИЛИЮ одним сообщением латиницей. Пример: ANNA IVANOVA")
+        await message.answer(
+            "Введите ИМЯ И ФАМИЛИЮ одним сообщением латиницей. Пример: ANNA IVANOVA",
+            reply_markup=global_back_keyboard("full_name"),
+        )
         return
     await state.update_data(full_name=name)
     await state.set_state(GlobalOrderFlow.phone)
-    await message.answer("📱 Введите номер телефона с кодом страны. Например: +491701234567")
+    await message.answer(
+        "📱 Введите номер телефона с кодом страны. Например: +491701234567",
+        reply_markup=global_back_keyboard("phone"),
+    )
 
 
 @dox.dp.message(GlobalOrderFlow.phone, F.chat.type == "private")
 async def global_recipient_phone(message: Message, state: FSMContext):
     phone = (message.text or "").strip()
     if not global_valid_phone(phone):
-        await message.answer("Укажите телефон с + и кодом страны, например: +491701234567")
+        await message.answer(
+            "Укажите телефон с + и кодом страны, например: +491701234567",
+            reply_markup=global_back_keyboard("phone"),
+        )
         return
     await state.update_data(phone=phone)
     await state.set_state(GlobalOrderFlow.country)
-    await message.answer("🌍 Введите СТРАНУ доставки латиницей. Например: Germany")
+    await message.answer(
+        "🌍 Введите СТРАНУ доставки латиницей. Например: Germany",
+        reply_markup=global_back_keyboard("country"),
+    )
 
 
 @dox.dp.message(GlobalOrderFlow.country, F.chat.type == "private")
 async def global_country(message: Message, state: FSMContext):
     value = (message.text or "").strip()
     if not global_latin_text(value, 3):
-        await message.answer("Введите страну латиницей, например Germany или Kazakhstan.")
+        await message.answer(
+            "Введите страну латиницей, например Germany или Kazakhstan.",
+            reply_markup=global_back_keyboard("country"),
+        )
         return
     await state.update_data(country=value)
     await state.set_state(GlobalOrderFlow.city)
-    await message.answer("🏙 Введите ГОРОД доставки латиницей. Например: Berlin")
+    await message.answer(
+        "🏙 Введите ГОРОД доставки латиницей. Например: Berlin",
+        reply_markup=global_back_keyboard("city"),
+    )
 
 
 @dox.dp.message(GlobalOrderFlow.city, F.chat.type == "private")
 async def global_city(message: Message, state: FSMContext):
     value = (message.text or "").strip()
     if not global_latin_text(value):
-        await message.answer("Введите город латиницей, например Berlin.")
+        await message.answer(
+            "Введите город латиницей, например Berlin.",
+            reply_markup=global_back_keyboard("city"),
+        )
         return
     await state.update_data(city=value)
     await state.set_state(GlobalOrderFlow.postal)
     await message.answer(
         "📮 Введите ПОЧТОВЫЙ ИНДЕКС получателя.\n"
         "Это обязательное поле для международного заказа, пропустить нельзя.\n"
-        "Примеры: 10115, SW1A 1AA, 050000."
+        "Примеры: 10115, SW1A 1AA, 050000.",
+        reply_markup=global_back_keyboard("postal"),
     )
 
 
 async def global_to_street(message: Message, state: FSMContext, postal: str):
     if not global_valid_postal(postal):
         await state.set_state(GlobalOrderFlow.postal)
-        await message.answer("📮 Почтовый индекс обязателен. Введите индекс, чтобы продолжить заказ.")
+        await message.answer(
+            "📮 Почтовый индекс обязателен. Введите индекс, чтобы продолжить заказ.",
+            reply_markup=global_back_keyboard("postal"),
+        )
         return
     await state.update_data(postal=postal)
     await state.set_state(GlobalOrderFlow.street)
     await message.answer(
         "📍 Введите полный адрес УЛИЦЫ, ДОМ и КВАРТИРУ (если есть) латиницей "
-        "одним сообщением.\nПример: Friedrichstrasse 10, Apt 5"
+        "одним сообщением.\nПример: Friedrichstrasse 10, Apt 5",
+        reply_markup=global_back_keyboard("street"),
     )
 
 
@@ -1362,7 +1408,8 @@ async def global_postal(message: Message, state: FSMContext):
     if not global_valid_postal(value):
         await message.answer(
             "📮 Почтовый индекс обязателен. Введите индекс латиницей/цифрами "
-            "(2–16 символов). Примеры: 10115, SW1A 1AA. Пропустить нельзя."
+            "(2–16 символов). Примеры: 10115, SW1A 1AA. Пропустить нельзя.",
+            reply_markup=global_back_keyboard("postal"),
         )
         return
     await global_to_street(message, state, value)
@@ -1393,7 +1440,8 @@ async def global_show_review(message: Message, state: FSMContext):
         await state.set_state(GlobalOrderFlow.postal)
         await message.answer(
             "📮 Для оформления международного заказа укажите почтовый индекс. "
-            "Без него подтвердить заказ нельзя."
+            "Без него подтвердить заказ нельзя.",
+            reply_markup=global_back_keyboard("postal"),
         )
         return
     try:
@@ -1413,6 +1461,7 @@ async def global_show_review(message: Message, state: FSMContext):
     await state.set_state(dox.OrderForm.confirm)
     await message.answer(dox._clip(text), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Подтвердить заказ", callback_data="order_ok")],
+        [InlineKeyboardButton(text="⬅️ Назад к адресу", callback_data="gprev:review")],
         [InlineKeyboardButton(text="✏️ Заполнить заново", callback_data="order_redo")],
     ]))
 
@@ -1421,13 +1470,19 @@ async def global_show_review(message: Message, state: FSMContext):
 async def global_street(message: Message, state: FSMContext):
     street = (message.text or "").strip()
     if not global_latin_text(street, 5):
-        await message.answer("Введите улицу, дом и квартиру латиницей, например Friedrichstrasse 10, Apt 5")
+        await message.answer(
+            "Введите улицу, дом и квартиру латиницей, например Friedrichstrasse 10, Apt 5",
+            reply_markup=global_back_keyboard("street"),
+        )
         return
     data = await state.get_data()
     postcode = (data.get("postal") or "").strip()
     if not global_valid_postal(postcode):
         await state.set_state(GlobalOrderFlow.postal)
-        await message.answer("📮 Почтовый индекс обязателен. Сначала введите индекс.")
+        await message.answer(
+            "📮 Почтовый индекс обязателен. Сначала введите индекс.",
+            reply_markup=global_back_keyboard("postal"),
+        )
         return
     combined_address = (
         f"{data['country']}, {data['city']}, {postcode}, {street}"
@@ -1438,6 +1493,125 @@ async def global_street(message: Message, state: FSMContext):
     await global_show_review(message, state)
 
 
+
+
+async def global_back_to_previous_pair(message: Message, state: FSMContext):
+    """Edit the latest completed pair but retain all earlier selected pairs."""
+    data = await state.get_data()
+    items = list(data.get("items", []))
+    if not items:
+        await state.clear()
+        await show_set_choice(message)
+        return
+    last = items.pop()
+    await state.update_data(items=items, od=None, model_code=None, category=None)
+    await message.answer(
+        f"⬅️ Возврат к предыдущей паре: {last.get('model', '')}. "
+        "Выберите её заново; остальные выбранные пары сохранены."
+    )
+    await global_next_pair(message, state)
+
+
+@dox.dp.callback_query(F.data.startswith("gprev:"))
+async def global_back_one_step(callback: CallbackQuery, state: FSMContext):
+    """Go back one wizard step; reject stale/forward-skipping buttons."""
+    if not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Кнопка доступна только в личном чате.", show_alert=True)
+        return
+    if not dox._client_creator_code(callback.from_user.id):
+        await callback.answer("Откройте бота по ссылке продавца.", show_alert=True)
+        return
+    stage = (callback.data or "").partition(":")[2]
+    expected_states = {
+        "category": GlobalOrderFlow.category.state,
+        "model": GlobalOrderFlow.model.state,
+        "od": GlobalOrderFlow.od.state,
+        "os": GlobalOrderFlow.os.state,
+        "full_name": GlobalOrderFlow.full_name.state,
+        "phone": GlobalOrderFlow.phone.state,
+        "country": GlobalOrderFlow.country.state,
+        "city": GlobalOrderFlow.city.state,
+        "postal": GlobalOrderFlow.postal.state,
+        "street": GlobalOrderFlow.street.state,
+        "review": dox.OrderForm.confirm.state,
+    }
+    if stage not in expected_states or await state.get_state() != expected_states[stage]:
+        await callback.answer("Эта кнопка устарела. Используйте кнопку под последним вопросом.",
+                              show_alert=True)
+        return
+    await callback.answer()
+    # Retire the button to discourage reuse. Navigation still works if this
+    # Telegram edit fails, e.g. on an old message with protected markup.
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if stage in ("category", "full_name"):
+        await global_back_to_previous_pair(callback.message, state)
+        return
+    transitions = {
+        "model": (GlobalOrderFlow.category, "category"),
+        "od": (GlobalOrderFlow.model, "model"),
+        "os": (GlobalOrderFlow.od, "od"),
+        "phone": (GlobalOrderFlow.full_name, "full_name"),
+        "country": (GlobalOrderFlow.phone, "phone"),
+        "city": (GlobalOrderFlow.country, "country"),
+        "postal": (GlobalOrderFlow.city, "city"),
+        "street": (GlobalOrderFlow.postal, "postal"),
+        "review": (GlobalOrderFlow.street, "street"),
+    }
+    target_state, target_name = transitions[stage]
+    await state.set_state(target_state)
+    data = await state.get_data()
+    if target_name == "category":
+        await callback.message.answer(
+            f"👁 Пара {data['pair_number']} из {SET_COUNTS[data['set_code']]}. "
+            "Выберите цветовой каталог:",
+            reply_markup=global_category_keyboard(data['set_code'], data['pair_number']),
+        )
+    elif target_name == "model":
+        category = data.get("category")
+        pair_number = data.get("pair_number")
+        if category not in GLOBAL_BY_CATEGORY or not pair_number:
+            await state.set_state(GlobalOrderFlow.category)
+            await callback.message.answer(
+                "Выберите цветовой каталог:",
+                reply_markup=global_category_keyboard(data["set_code"], len(data.get("items", [])) + 1),
+            )
+            return
+        await callback.message.answer(
+            "⬅️ Выберите модель линз ещё раз:",
+            reply_markup=global_model_keyboard(pair_number, category),
+        )
+    elif target_name in ("od", "os"):
+        model = GLOBAL_MODELS.get(data.get("model_code"))
+        if not model:
+            await state.set_state(GlobalOrderFlow.model)
+            await callback.message.answer(
+                "Выберите модель линз:",
+                reply_markup=global_model_keyboard(data["pair_number"], data["category"]),
+            )
+            return
+        if target_name == "od":
+            prompt = f"👁 {model.name}. Введите диоптрию ПРАВОГО глаза (OD).\n{global_diopter_hint(model)}"
+        else:
+            prompt = f"👁 {model.name}. Введите диоптрию ЛЕВОГО глаза (OS).\n{global_diopter_hint(model)}"
+        await callback.message.answer(prompt, reply_markup=global_back_keyboard(target_name))
+    else:
+        prompts = {
+            "full_name": "👤 Введите ИМЯ И ФАМИЛИЮ латиницей одним сообщением. Пример: ANNA IVANOVA",
+            "phone": "📱 Введите телефон с кодом страны. Пример: +491701234567",
+            "country": "🌍 Введите СТРАНУ доставки латиницей. Пример: Germany",
+            "city": "🏙 Введите ГОРОД доставки латиницей. Пример: Berlin",
+            "postal": "📮 Введите ПОЧТОВЫЙ ИНДЕКС. Это обязательное поле, пропуск невозможен.",
+            "street": "📍 Введите УЛИЦУ, ДОМ и КВАРТИРУ латиницей. Пример: Friedrichstrasse 10, Apt 5",
+        }
+        await callback.message.answer(
+            f"⬅️ Назад.\n{prompts[target_name]}",
+            reply_markup=global_back_keyboard(target_name),
+        )
+
+
 @dox.dp.message(GlobalCommand("cancel"), StateFilter(GlobalOrderFlow), F.chat.type == "private")
 async def global_cancel_order(message: Message, state: FSMContext):
     await state.clear()
@@ -1446,7 +1620,7 @@ async def global_cancel_order(message: Message, state: FSMContext):
 
 # Lightweight on-server version check. Use /doxversion in @DOXGlobalBot
 # to distinguish an installed file from an older deployment.
-GLOBAL_UI_VERSION = "DOX Global • обязательный индекс • 23.11.2026 v5"
+GLOBAL_UI_VERSION = "DOX Global • кнопка Назад на каждом шаге • 27.11.2026 v6"
 
 
 @dox.dp.message(GlobalCommand("doxversion"), F.chat.type == "private")
@@ -1488,7 +1662,7 @@ dox.dp.message.middleware(GlobalWelcomeMenuMiddleware())
 # handlers, so no older text handler accidentally absorbs the wizard input.
 _global_flow_callbacks = {
     global_choose_set, global_select_category, global_back_to_category,
-    global_select_model, global_postal_skip,
+    global_select_model, global_postal_skip, global_back_one_step,
 }
 _global_flow_messages = {
     global_od, global_os, global_recipient_name, global_recipient_phone,
