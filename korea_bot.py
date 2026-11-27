@@ -274,15 +274,21 @@ def start_keyboard():
     return inline([[('🛍 Заказать PREMIUM SET 1', 'begin')]])
 
 
+def back_keyboard(step: str, extra_rows=None, pair_number: int | None = None):
+    """Navigation is bound to current FSM step and (when relevant) pair number."""
+    payload = f"kback:{step}" + (f":{pair_number}" if pair_number is not None else "")
+    return inline(list(extra_rows or []) + [[("⬅️ Назад", payload)]])
+
+
 def categories_keyboard(pair_number: int):
     rows = [[(title, f"cat:{pair_number}:{code}")]
             for code, (title, _) in CATEGORIES.items()]
-    return inline(rows)
+    return back_keyboard("category", rows, pair_number)
 
 
 def models_keyboard(pair_number: int, category: str):
-    return inline([[(m.name, f"model:{pair_number}:{m.code}")]
-                   for m in BY_CATEGORY[category]] + [[("⬅️ Назад к цветам", f"back:{pair_number}")]])
+    return back_keyboard("model", [[(m.name, f"model:{pair_number}:{m.code}")]
+                                   for m in BY_CATEGORY[category]], pair_number)
 
 
 def manager_buttons(order_id: int):
@@ -373,19 +379,136 @@ async def begin_flow(message: Message, state: FSMContext, buyer_id: int):
     await next_pair(message, state)
 
 
+async def show_full_name_prompt(message: Message, state: FSMContext):
+    await state.set_state(OrderFlow.full_name)
+    await message.answer(
+        "✅ Вы выбрали все 3 пары.\n\n"
+        "Введите ИМЯ И ФАМИЛИЮ одним сообщением, английскими буквами.\n"
+        "Например: ANNA IVANOVA",
+        reply_markup=back_keyboard("full_name"),
+    )
+
+
+async def show_phone_prompt(message: Message, state: FSMContext):
+    await state.set_state(OrderFlow.phone)
+    await message.answer("Введите номер мобильного телефона в Корее, например 010-1234-5678.",
+                         reply_markup=back_keyboard("phone"))
+
+
+async def show_postal_prompt(message: Message, state: FSMContext):
+    await state.set_state(OrderFlow.postal)
+    await message.answer(
+        "Почтовый индекс (우편번호) — НЕОБЯЗАТЕЛЬНО.\n"
+        "Если знаете, введите 5 цифр, например 12345.\n"
+        "Если нет — нажмите «Пропустить индекс» или отправьте «-».",
+        reply_markup=back_keyboard("postal", [[('⏭ Пропустить индекс', 'skip_postal')]]),
+    )
+
+
+async def show_address_prompt(message: Message, state: FSMContext):
+    await state.set_state(OrderFlow.address)
+    await message.answer(
+        "Введите ПОЛНЫЙ адрес доставки на корейском языке (한글).\n"
+        "Например: 서울특별시 강남구 테헤란로 123",
+        reply_markup=back_keyboard("address"),
+    )
+
+
+async def show_address_detail_prompt(message: Message, state: FSMContext):
+    await state.set_state(OrderFlow.address_detail)
+    await message.answer(
+        "Укажите номер квартиры, корпуса, этажа или офиса на корейском языке.\n"
+        "Например: 101동 502호. Если уточнений нет, отправьте «-».",
+        reply_markup=back_keyboard("address_detail"),
+    )
+
+
+async def show_review_prompt(message: Message, state: FSMContext):
+    await state.set_state(OrderFlow.review)
+    data = await state.get_data()
+    await message.answer(order_review(data), reply_markup=back_keyboard("review", [
+        [("✅ Подтвердить заказ", "confirm")],
+        [("🔁 Заполнить заново", "restart")],
+    ]))
+
+
+async def show_od_prompt(message: Message, state: FSMContext):
+    data = await state.get_data()
+    model = BY_CODE[data["model_code"]]
+    number = data["pair_number"]
+    await state.set_state(OrderFlow.od)
+    await message.answer(
+        f"👁 Пара {number}: {model.name}\n"
+        + (f"✨ Доплата за AURA: +{format_krw(AURA_SURCHARGE_KRW)} ₩.\n"
+           if model.name in AURA_MODELS else "")
+        + "\nВведите диоптрию ПРАВОГО глаза (OD).\n"
+        f"{diopter_hint(model)}\n"
+        "Для линз без диоптрий введите 0.00.",
+        reply_markup=back_keyboard("od", pair_number=number),
+    )
+
+
+async def show_os_prompt(message: Message, state: FSMContext):
+    data = await state.get_data()
+    model = BY_CODE[data["model_code"]]
+    await state.set_state(OrderFlow.os)
+    await message.answer(f"Теперь введите диоптрию ЛЕВОГО глаза (OS) для {model.name}.\n"
+                         f"{diopter_hint(model)}",
+                         reply_markup=back_keyboard("os", pair_number=data["pair_number"]))
+
+
+async def show_model_prompt(message: Message, state: FSMContext):
+    data = await state.get_data()
+    number, code = data["pair_number"], data["category"]
+    title, filename = CATEGORIES[code]
+    photo = IMAGE_DIR / filename
+    await state.set_state(OrderFlow.model)
+    text = f"👁 Пара {number} из 3. Каталог: {title}\nВыберите модель под фотографией."
+    if photo.is_file():
+        await message.answer_photo(FSInputFile(photo), caption=text,
+                                   reply_markup=models_keyboard(number, code))
+    else:
+        await message.answer(text, reply_markup=models_keyboard(number, code))
+
+
+async def restore_previous_pair(message: Message, state: FSMContext):
+    """Roll back the last completed pair so the customer can edit it."""
+    data = await state.get_data()
+    pairs = list(data.get("pairs", []))
+    if not pairs:
+        await message.answer("Предыдущей пары нет. Выберите первый каталог.",
+                             reply_markup=categories_keyboard(1))
+        await state.set_state(OrderFlow.category)
+        return
+    previous = pairs.pop()
+    model = next((m for m in BY_CODE.values() if m.name == previous["model"]), None)
+    number = len(pairs) + 1
+    await state.update_data(pairs=pairs, pair_number=number, category=model.category if model else None,
+                            model_code=model.code if model else None,
+                            od=previous.get("od"))
+    if not model:
+        await state.set_state(OrderFlow.category)
+        await message.answer(f"↩️ Возвращаемся к паре {number}. Выберите каталог:",
+                             reply_markup=categories_keyboard(number))
+    elif len(model.diopters) == 1:
+        # Fixed-zero lenses have no OD/OS input: back to their model selection.
+        await message.answer(f"↩️ Возвращаемся к паре {number}. Выберите модель заново.")
+        await show_model_prompt(message, state)
+    else:
+        await message.answer(f"↩️ Возвращаемся к паре {number}.\n"
+                             f"Выбранная модель: {model.name}; OD {previous['od']}.\n"
+                             "Введите OS заново или нажмите «Назад», чтобы изменить OD/модель.")
+        await show_os_prompt(message, state)
+
+
 async def next_pair(message: Message, state: FSMContext):
     data = await state.get_data()
     count = len(data.get("pairs", []))
     if count >= REQUIRED_PAIRS:
-        await state.set_state(OrderFlow.full_name)
-        await message.answer(
-            "✅ Вы выбрали все 3 пары.\n\n"
-            "Введите ИМЯ И ФАМИЛИЮ одним сообщением, английскими буквами.\n"
-            "Например: ANNA IVANOVA"
-        )
+        await show_full_name_prompt(message, state)
         return
     number = count + 1
-    await state.update_data(pair_number=number)
+    await state.update_data(pair_number=number, category=None, model_code=None, od=None)
     await state.set_state(OrderFlow.category)
     await message.answer(f"👁 Пара {number} из 3. Выберите цветовой каталог:",
                          reply_markup=categories_keyboard(number))
@@ -465,35 +588,71 @@ async def category_callback(call: CallbackQuery, state: FSMContext):
             data.get("pair_number") != number or code not in CATEGORIES):
         await call.answer("Кнопка устарела. Используйте последний шаг заказа.", show_alert=True)
         return
-    await state.update_data(category=code)
-    await state.set_state(OrderFlow.model)
-    title, filename = CATEGORIES[code]
-    photo = IMAGE_DIR / filename
+    await state.update_data(category=code, model_code=None, od=None)
     await call.answer()
-    text = f"👁 Пара {number} из 3. Каталог: {title}\nВыберите модель под фотографией."
-    if photo.is_file():
-        await call.message.answer_photo(FSInputFile(photo), caption=text,
-                                        reply_markup=models_keyboard(number, code))
-    else:
-        await call.message.answer(text, reply_markup=models_keyboard(number, code))
+    await show_model_prompt(call.message, state)
 
 
-@dp.callback_query(F.data.startswith("back:"))
-async def back_callback(call: CallbackQuery, state: FSMContext):
-    try:
-        number = int(call.data.split(":")[1])
-    except (IndexError, ValueError):
-        await call.answer("Неверная кнопка", show_alert=True)
+@dp.callback_query(F.data.startswith("kback:"))
+async def navigate_back(call: CallbackQuery, state: FSMContext):
+    if not call.message or call.message.chat.type != "private":
+        await call.answer("Эта кнопка доступна только в личном чате.", show_alert=True)
         return
+    pieces = call.data.split(":")
+    step = pieces[1] if len(pieces) >= 2 else ""
+    current = await state.get_state()
+    expected = getattr(OrderFlow, step, None)
     data = await state.get_data()
-    if (await state.get_state() != OrderFlow.model.state or
-            data.get("pair_number") != number):
-        await call.answer("Кнопка устарела.", show_alert=True)
+    if (not isinstance(expected, State) or current != expected.state or
+            (step in ("category", "model", "od", "os") and
+             (len(pieces) != 3 or not pieces[2].isdigit() or
+              int(pieces[2]) != data.get("pair_number")))):
+        await call.answer("Старая кнопка. Используйте кнопки последнего шага.", show_alert=True)
         return
-    await state.set_state(OrderFlow.category)
     await call.answer()
-    await call.message.answer(f"Выберите каталог для пары {number}:",
-                              reply_markup=categories_keyboard(number))
+    if step == "category":
+        if data.get("pairs"):
+            await restore_previous_pair(call.message, state)
+        else:
+            await state.clear()
+            await call.message.answer("↩️ Вернулись к началу заказа.\n"
+                                      "Нажмите кнопку ниже, чтобы снова выбрать PREMIUM SET 1.",
+                                      reply_markup=start_keyboard())
+    elif step == "model":
+        await state.update_data(model_code=None, od=None, category=None)
+        await state.set_state(OrderFlow.category)
+        number = data["pair_number"]
+        await call.message.answer(f"👁 Пара {number} из 3. Выберите цветовой каталог:",
+                                  reply_markup=categories_keyboard(number))
+    elif step == "od":
+        await state.update_data(model_code=None, od=None)
+        await show_model_prompt(call.message, state)
+    elif step == "os":
+        await state.update_data(od=None)
+        await show_od_prompt(call.message, state)
+    elif step == "full_name":
+        await restore_previous_pair(call.message, state)
+    elif step == "phone":
+        await show_full_name_prompt(call.message, state)
+    elif step == "postal":
+        await show_phone_prompt(call.message, state)
+    elif step == "address":
+        await show_postal_prompt(call.message, state)
+    elif step == "address_detail":
+        await show_address_prompt(call.message, state)
+    elif step == "review":
+        await show_address_detail_prompt(call.message, state)
+    elif step == "receipt":
+        order_id = data.get("receipt_order_id")
+        order = get_order(order_id) if order_id else None
+        if not order or order["buyer_id"] != call.from_user.id:
+            await call.message.answer("Заказ не найден. Для нового заказа нажмите /start.")
+            await state.clear()
+            return
+        await state.clear()
+        await call.message.answer(bank_text(order_id, order["amount_krw"]), reply_markup=inline([
+            [("📷 Прикрепить скриншот оплаты", f"receipt:{order_id}")]
+        ]))
 
 
 @dp.callback_query(F.data.startswith("model:"))
@@ -521,15 +680,7 @@ async def model_callback(call: CallbackQuery, state: FSMContext):
                                   f"\nТекущая цена сета: {format_krw(set_total_krw(pairs))} ₩.")
         await next_pair(call.message, state)
         return
-    await state.set_state(OrderFlow.od)
-    await call.message.answer(
-        f"👁 Пара {n}: {model.name}\n"
-        + (f"✨ Доплата за AURA: +{format_krw(AURA_SURCHARGE_KRW)} ₩.\n"
-           if model.name in AURA_MODELS else "")
-        + "\nВведите диоптрию ПРАВОГО глаза (OD).\n"
-        f"{diopter_hint(model)}\n"
-        "Для линз без диоптрий введите 0.00."
-    )
+    await show_od_prompt(call.message, state)
 
 
 @dp.message(OrderFlow.od, F.chat.type == "private")
@@ -538,12 +689,11 @@ async def right_power(message: Message, state: FSMContext):
     model = BY_CODE[data["model_code"]]
     value = normalize_diopter(message.text or "", model)
     if value is None:
-        await message.answer(f"Эта диоптрия не указана для {model.name}.\n{diopter_hint(model)}")
+        await message.answer(f"Эта диоптрия не указана для {model.name}.\n{diopter_hint(model)}",
+                             reply_markup=back_keyboard("od", pair_number=data["pair_number"]))
         return
     await state.update_data(od=value)
-    await state.set_state(OrderFlow.os)
-    await message.answer(f"Теперь введите диоптрию ЛЕВОГО глаза (OS) для {model.name}.\n"
-                         f"{diopter_hint(model)}")
+    await show_os_prompt(message, state)
 
 
 @dp.message(OrderFlow.os, F.chat.type == "private")
@@ -552,7 +702,8 @@ async def left_power(message: Message, state: FSMContext):
     model = BY_CODE[data["model_code"]]
     value = normalize_diopter(message.text or "", model)
     if value is None:
-        await message.answer(f"Эта диоптрия не указана для {model.name}.\n{diopter_hint(model)}")
+        await message.answer(f"Эта диоптрия не указана для {model.name}.\n{diopter_hint(model)}",
+                             reply_markup=back_keyboard("os", pair_number=data["pair_number"]))
         return
     pairs = data["pairs"] + [{"model": model.name, "od": data["od"], "os": value}]
     await state.update_data(pairs=pairs, model_code=None, od=None)
@@ -585,13 +736,13 @@ async def full_name(message: Message, state: FSMContext):
     if parsed is None:
         await message.answer(
             "Введите имя и фамилию ОДНИМ сообщением английскими буквами.\n"
-            "Например: ANNA IVANOVA"
+            "Например: ANNA IVANOVA",
+            reply_markup=back_keyboard("full_name"),
         )
         return
     first, last = parsed
     await state.update_data(first_name=first, last_name=last)
-    await state.set_state(OrderFlow.phone)
-    await message.answer("Введите номер мобильного телефона в Корее, например 010-1234-5678.")
+    await show_phone_prompt(message, state)
 
 
 def valid_korea_phone(raw: str) -> bool:
@@ -603,25 +754,16 @@ def valid_korea_phone(raw: str) -> bool:
 async def phone(message: Message, state: FSMContext):
     value = (message.text or "").strip()
     if not valid_korea_phone(value):
-        await message.answer("Укажите корейский номер в формате 010-1234-5678 или +82 10 1234 5678.")
+        await message.answer("Укажите корейский номер в формате 010-1234-5678 или +82 10 1234 5678.",
+                             reply_markup=back_keyboard("phone"))
         return
     await state.update_data(phone=value)
-    await state.set_state(OrderFlow.postal)
-    await message.answer(
-        "Почтовый индекс (우편번호) — НЕОБЯЗАТЕЛЬНО.\n"
-        "Если знаете, введите 5 цифр, например 12345.\n"
-        "Если нет — нажмите «Пропустить индекс» или отправьте «-».",
-        reply_markup=inline([[('⏭ Пропустить индекс', 'skip_postal')]])
-    )
+    await show_postal_prompt(message, state)
 
 
 async def proceed_to_address(message: Message, state: FSMContext, postal_value: str):
     await state.update_data(postal=postal_value)
-    await state.set_state(OrderFlow.address)
-    await message.answer(
-        "Введите ПОЛНЫЙ адрес доставки на корейском языке (한글).\n"
-        "Например: 서울특별시 강남구 테헤란로 123"
-    )
+    await show_address_prompt(message, state)
 
 
 @dp.callback_query(F.data == "skip_postal")
@@ -643,7 +785,7 @@ async def postal(message: Message, state: FSMContext):
         await message.answer(
             "Если указываете почтовый индекс, нужны ровно 5 цифр.\n"
             "Или нажмите «Пропустить индекс».",
-            reply_markup=inline([[('⏭ Пропустить индекс', 'skip_postal')]])
+            reply_markup=back_keyboard("postal", [[('⏭ Пропустить индекс', 'skip_postal')]])
         )
         return
     await proceed_to_address(message, state, value)
@@ -654,34 +796,31 @@ async def address(message: Message, state: FSMContext):
     value = (message.text or "").strip()
     if not (8 <= len(value) <= 250 and re.search(r"[가-힣]", value)):
         await message.answer("Адрес должен содержать корейские буквы и быть полным. "
-                             "Например: 서울특별시 강남구 테헤란로 123")
+                             "Например: 서울특별시 강남구 테헤란로 123",
+                             reply_markup=back_keyboard("address"))
         return
     await state.update_data(address=value)
-    await state.set_state(OrderFlow.address_detail)
-    await message.answer("Укажите номер квартиры, корпуса, этажа или офиса на корейском языке.\n"
-                         "Например: 101동 502호. Если уточнений нет, отправьте «-».")
+    await show_address_detail_prompt(message, state)
 
 
 @dp.message(OrderFlow.address_detail, F.chat.type == "private")
 async def address_detail(message: Message, state: FSMContext):
     value = (message.text or "").strip()
     if not value or len(value) > 120 or (value != "-" and not re.search(r"[가-힣]", value)):
-        await message.answer("Напишите детальный адрес на корейском (например, 101동 502호) или «-».")
+        await message.answer("Напишите детальный адрес на корейском (например, 101동 502호) или «-».",
+                             reply_markup=back_keyboard("address_detail"))
         return
     await state.update_data(address_detail=value)
-    await state.set_state(OrderFlow.review)
-    data = await state.get_data()
-    await message.answer(order_review(data), reply_markup=inline([
-        [("✅ Подтвердить заказ", "confirm")],
-        [("🔁 Заполнить заново", "restart")],
-    ]))
+    await show_review_prompt(message, state)
 
 
 @dp.callback_query(F.data == "restart")
 async def restart_flow(call: CallbackQuery, state: FSMContext):
+    if call.message.chat.type != "private" or await state.get_state() != OrderFlow.review.state:
+        await call.answer("Кнопка больше неактуальна.", show_alert=True)
+        return
     await call.answer()
-    if call.message.chat.type == "private":
-        await begin_flow(call.message, state, call.from_user.id)
+    await begin_flow(call.message, state, call.from_user.id)
 
 
 @dp.callback_query(F.data == "confirm")
@@ -739,7 +878,8 @@ async def receipt_begin(call: CallbackQuery, state: FSMContext):
     await call.message.answer(
         f"📷 Заказ №{order_id}\nПришлите фото или скриншот перевода как изображение. "
         "Можно отправить JPG/PNG файлом.\n"
-        "Не отправляйте пароли, полный номер банковской карты или другие секретные данные."
+        "Не отправляйте пароли, полный номер банковской карты или другие секретные данные.",
+        reply_markup=back_keyboard("receipt"),
     )
 
 
@@ -757,7 +897,8 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
     if message.document and message.document.mime_type in ("image/jpeg", "image/png", "image/webp"):
         document_id = message.document.file_id
     if not photo_id and not document_id:
-        await message.answer("Пришлите именно ФОТО чека или JPG/PNG-файл с изображением оплаты.")
+        await message.answer("Пришлите именно ФОТО чека или JPG/PNG-файл с изображением оплаты.",
+                             reply_markup=back_keyboard("receipt"))
         return
     caption = (f"📷 ЧЕК ПО ЗАКАЗУ №{order_id}\n"
                f"Креатор: {order['creator_code'] or 'не указан'}\n"
